@@ -22,6 +22,7 @@ PLAN_FILE = ROOT / "english-168-evenings.txt"
 DECK_FILE = ROOT / "english-anki-deck.csv"
 OUT_FILE = ROOT / "data.js"
 INDEX_FILE = ROOT / "index.html"
+DEMO_FILE = ROOT / "demo.html"
 
 EXPECTED_DAYS = 168
 EXPECTED_CARDS = 1008
@@ -257,11 +258,14 @@ def stamp_index():
         if f.exists():
             h.update(f.read_bytes())
     tag = h.hexdigest()[:8]
-    html = INDEX_FILE.read_text(encoding="utf-8")
-    new = re.sub(r'(href|src)="(style\.css|app\.js|data\.js)\?v=[^"]*"',
-                 lambda m: '%s="%s?v=%s"' % (m.group(1), m.group(2), tag), html)
-    if new != html:
-        INDEX_FILE.write_text(new, encoding="utf-8")
+    for f in (INDEX_FILE, DEMO_FILE):
+        if not f.exists():
+            continue
+        html = f.read_text(encoding="utf-8")
+        new = re.sub(r'(href|src)="(style\.css|app\.js|data\.js)\?v=[^"]*"',
+                     lambda m: '%s="%s?v=%s"' % (m.group(1), m.group(2), tag), html)
+        if new != html:
+            f.write_text(new, encoding="utf-8")
     return tag
 
 

@@ -4,13 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
 <meta name="color-scheme" content="dark">
-<title>Вечерний английский</title>
+<title>Вечерний английский — демо</title>
 <link rel="stylesheet" href="style.css?v=67151e88">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 </head>
 <body>
 
 <div id="app" hidden>
+
+  <div class="demobar">ДЕМО · ничего не сохраняется и в план не идёт</div>
 
   <header class="topbar">
     <div class="topbar__title" id="topTitle">Сегодня</div>
@@ -82,6 +84,50 @@
 
 <div id="fatal" class="fatal" hidden></div>
 
+<script>
+(function () {
+  var real = (window.Telegram && window.Telegram.WebApp) || {};
+  var mem = {};                                  /* всё состояние живёт только тут */
+  function later(fn) { setTimeout(fn, 1); }
+  function call(name) {
+    return function () {
+      try { if (typeof real[name] === 'function') return real[name].apply(real, arguments); }
+      catch (e) {}
+    };
+  }
+  function guard(name, minVer) {
+    return function () {
+      try {
+        if (real.isVersionAtLeast && !real.isVersionAtLeast(minVer)) return;
+        if (typeof real[name] === 'function') return real[name].apply(real, arguments);
+      } catch (e) {}
+    };
+  }
+  window.Telegram = { WebApp: {
+    version: real.version || '6.0',
+    platform: real.platform || 'unknown',
+    initDataUnsafe: {},                          /* без start_param: демо всегда своё */
+    ready: call('ready'),
+    expand: call('expand'),
+    setHeaderColor: guard('setHeaderColor', '6.1'),
+    setBackgroundColor: guard('setBackgroundColor', '6.1'),
+    disableVerticalSwipes: guard('disableVerticalSwipes', '7.7'),
+    /* всегда «да»: иначе приложение решит, что CloudStorage нет, и начнёт
+       писать в localStorage — а демо не должно оставлять следов вообще */
+    isVersionAtLeast: function () { return true; },
+    sendData: undefined,                         /* боту из демо ничего не уходит */
+    CloudStorage: {
+      setItem: function (k, v, cb) { later(function () { mem[k] = String(v); cb && cb(null, true); }); },
+      getItem: function (k, cb) { later(function () { cb(null, k in mem ? mem[k] : ''); }); },
+      getItems: function (ks, cb) { later(function () {
+        var o = {}; ks.forEach(function (k) { o[k] = (k in mem) ? mem[k] : ''; }); cb(null, o); }); },
+      getKeys: function (cb) { later(function () { cb(null, Object.keys(mem)); }); },
+      removeItems: function (ks, cb) { later(function () {
+        ks.forEach(function (k) { delete mem[k]; }); cb && cb(null, true); }); }
+    }
+  }};
+})();
+</script>
 <script src="data.js?v=67151e88"></script>
 <script src="app.js?v=67151e88"></script>
 </body>
