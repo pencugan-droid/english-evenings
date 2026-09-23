@@ -22,6 +22,22 @@ var EVENING_H = 22;                    /* с этого часа вкладка 
    закрыты карточки, тем длиннее разговор. */
 var STAGE_MIN = { Words: 8, Story: 8, Retell: 12, Result: 12 };
 var TALK_MIN = 10;                     /* короче этого Talk не бывает */
+var REVIEW_MAX = 12;                   /* сколько ошибок подставлять в промпт */
+var REVIEW_DAYS = 7;                   /* за сколько дней их брать */
+var REVIEW_KEEP = 30;                  /* сколько дней разборов вообще хранить */
+var WORDS_PER_DAY = 3;                 /* кандидатов в колоду за вечер */
+var TALK_TAG = 'talk';                 /* тег карточек, пришедших из разговоров */
+
+/* Этап разбора добавляет приложение, а не план: промпт один и тот же на все дни. */
+var REVIEW_LABEL = 'Review';
+var REVIEW_PROMPT =
+  'Разбор без похвалы. Перечисли мои ошибки за сегодняшний разговор: ' +
+  'грамматика (особенно past simple vs present perfect), неправильные глаголы, ' +
+  'слова, которых я не знал и сказал по-русски. ' +
+  'Формат каждой строки: моя ошибка \u2192 правильно. ' +
+  'Без вступления и без комплиментов. ' +
+  'В конце \u2014 3 слова или фразы, которые мне сегодня не хватило, ' +
+  'по-английски с переводом.';
 var FINISH_H = 22, FINISH_M = 58;      /* к этому времени вечер закрыт */
 
 /* кнопки «Во сколько лёг»: индекс -> минуты от 22:00 */
@@ -115,6 +131,18 @@ function pickNew(state, limit) {
   return out;
 }
 
+/* Карточки из разговоров идут СВЕРХ дневных шести: иначе они съедали бы
+   план, а он рассчитан ровно на 6 в день на все 168 вечеров. */
+function pickNewTalk(state) {
+  var out = [];
+  var n = (state.extra || []).length;
+  for (var k = 0; k < n && out.length < 6; k++) {
+    var id = CARDS.length + k;
+    if (!state.cards[id]) out.push(id);
+  }
+  return out;
+}
+
 function buildQueue(state, today) {
   var reviews = [];
   for (var k in state.cards) {
@@ -125,7 +153,7 @@ function buildQueue(state, today) {
     var da = state.cards[a].due, db = state.cards[b].due;
     return da !== db ? da - db : a - b;
   });
-  var news = pickNew(state, newAllowance(state, today));
+  var news = pickNew(state, newAllowance(state, today)).concat(pickNewTalk(state));
   return { reviews: reviews, news: news, all: reviews.concat(news) };
 }
 
@@ -134,12 +162,114 @@ function registerAnswer(state, id, grade, today) {
   var isNew = !state.cards[id];
   var before = state.cards[id] || freshCard();
   state.cards[id] = sm2(before, grade, today);
-  if (isNew) {
+  if (isNew && id < CARDS.length) {          /* карточки из разговоров лимит не тратят */
     if (state.newDate !== today) { state.newDate = today; state.newCount = 0; }
     state.newCount += 1;
     while (state.newScan < CARDS.length && state.cards[state.newScan]) state.newScan++;
   }
   return state.cards[id];
+}
+
+
+/* ------------------------------------------------- разбор ошибок за вечер */
+
+var ARROW = /\s*(?:→|->)\s*/;
+
+/* Текст от ChatGPT -> {mistakes, words}. Строки со стрелкой — ошибки,
+   строки вида «english — перевод» в конце — кандидаты в карточки. */
+function parseReview(text) {
+  var out = { mistakes: [], words: [] };
+  String(text || '').split('\n').forEach(function (raw) {
+    var ln = raw.replace(/^[\s\-–—*•]+/, '').replace(/^\d+[.)]\s*/, '').trim();
+    if (!ln) return;
+    if (ARROW.test(ln)) {
+      var p = ln.split(ARROW);
+      var w = (p[0] || '').trim();
+      var r = p.slice(1).join(' ').trim();
+      if (w && r) out.mistakes.push({ w: w, r: r });
+      return;
+    }
+    var m = /^([A-Za-z][A-Za-z'’\-\s,.()]{1,60}?)\s*[—–-]\s*([А-яЁё][^\n]{0,60})$/.exec(ln);
+    if (m) out.words.push({ en: m[1].trim(), ru: m[2].trim() });
+  });
+  out.words = out.words.slice(-WORDS_PER_DAY);
+  return out;
+}
+
+function reviewKey(w, r) {
+  return (w + '→' + r).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/* Сохранить разбор за дату. Дубли не копятся, старое подрезается. */
+function saveReview(state, dateNum, parsed) {
+  var seen = {};
+  (state.rev || []).forEach(function (x) { seen[reviewKey(x.w, x.r)] = 1; });
+  var added = 0;
+  parsed.mistakes.forEach(function (m) {
+    var k = reviewKey(m.w, m.r);
+    if (seen[k]) return;
+    seen[k] = 1;
+    state.rev.push({ d: dateNum, w: m.w, r: m.r });
+    added++;
+  });
+
+  var have = {};
+  (state.extra || []).forEach(function (x) { have[x.en.toLowerCase().trim()] = 1; });
+  var CARDS_N = CARDS.length;
+  var addedWords = 0;
+  parsed.words.forEach(function (w) {
+    if (addedWords >= WORDS_PER_DAY) return;
+    var k = w.en.toLowerCase().trim();
+    if (have[k]) return;
+    /* фраза уже есть в плане — второй раз не нужна */
+    for (var i = 0; i < CARDS_N; i++) {
+      if (CARDS[i].en.toLowerCase() === k) return;
+    }
+    have[k] = 1;
+    state.extra.push({ d: dateNum, en: w.en, ru: w.ru });
+    addedWords++;
+  });
+
+  /* держим только последние REVIEW_KEEP дней разборов */
+  state.rev = state.rev.filter(function (x) { return x.d > dateNum - REVIEW_KEEP; });
+  return { mistakes: added, words: addedWords };
+}
+
+/* Свежие ошибки за последние REVIEW_DAYS дней, без дублей, не больше REVIEW_MAX. */
+function recentMistakes(state, today) {
+  var seen = {}, out = [];
+  var list = (state.rev || []).slice().sort(function (a, b) { return b.d - a.d; });
+  for (var i = 0; i < list.length && out.length < REVIEW_MAX; i++) {
+    var x = list[i];
+    if (x.d <= today - REVIEW_DAYS || x.d > today) continue;
+    var k = reviewKey(x.w, x.r);
+    if (seen[k]) continue;
+    seen[k] = 1;
+    out.push(x);
+  }
+  return out;
+}
+
+/* Подставить накопленные ошибки в промпт первого этапа. Статичный список из
+   плана остаётся: это диагноз с теста, а свежие ошибки идут в дополнение. */
+function withMistakes(prompt, state, today) {
+  var list = recentMistakes(state, today);
+  if (!list.length) return prompt;
+  var block = '\nMy recent mistakes from our last sessions (fix these first, every time):\n' +
+    list.map(function (x) { return '- ' + x.w + ' → ' + x.r; }).join('\n') + '\n';
+  var i = prompt.indexOf('\nRules:');
+  return (i < 0) ? prompt + block : prompt.slice(0, i) + block + prompt.slice(i);
+}
+
+/* --------------------------------- колода = план + карточки из разговоров */
+
+function cardCount(state) { return CARDS.length + ((state && state.extra) ? state.extra.length : 0); }
+
+function cardAt(state, id) {
+  if (id < CARDS.length) return CARDS[id];
+  var x = state.extra[id - CARDS.length];
+  if (!x) return null;
+  return { id: id, n: id + 1, en: x.en, ru: x.ru, tag: TALK_TAG, day: 0, week: 0 };
 }
 
 /* ------------------------------------------------------------ статистика */
@@ -201,7 +331,9 @@ function blankState() {
   return {
     day: 1, sound: true, newScan: 0, newDate: 0, newCount: 0, cpDate: 0,
     evDate: 0, evStage: 0, evEnd: 0,
-    fin: {}, mrn: {}, cards: {}
+    fin: {}, mrn: {}, cards: {},
+    rev: [],                 /* [{d, w, r}] — дата, ошибка, как правильно */
+    extra: []                /* [{d, en, ru}] — карточки из разговоров */
   };
 }
 
@@ -223,17 +355,34 @@ function encodeState(s) {
            b36(c.ef) + ',' + b36(c.reps) + ',' + b36(c.lapses);
   }).join(';');
 
-  return [STATE_V, head, fin, mrn, crd].join('\n');
+  var rev = (s.rev || []).map(function (x) {
+    return b36(x.d) + ',' + enc(x.w) + ',' + enc(x.r);
+  }).join(';');
+
+  var ext = (s.extra || []).map(function (x) {
+    return b36(x.d) + ',' + enc(x.en) + ',' + enc(x.ru);
+  }).join(';');
+
+  return [STATE_V, head, fin, mrn, crd, rev, ext].join('\n');
 }
+
+/* encodeURIComponent экранирует и запятую, и точку с запятой, и перевод строки —
+   ровно те символы, которыми разделены поля. */
+function enc(t) { return encodeURIComponent(String(t == null ? '' : t)); }
+function dec(t) { try { return decodeURIComponent(t); } catch (e) { return t; } }
 
 function decodeState(str) {
   if (typeof str !== 'string' || !str) throw new Error('пустое состояние');
   var parts = str.split('\n');
-  if (parts.length !== 5) throw new Error('ожидалось 5 секций, получено ' + parts.length);
+  /* 5 секций — состояние до появления разбора ошибок; принимаем и дополняем */
+  if (parts.length === 5) parts = parts.concat(['', '']);
+  if (parts.length !== 7) throw new Error('ожидалось 7 секций, получено ' + parts.length);
   if (p36(parts[0]) !== STATE_V) throw new Error('версия состояния ' + parts[0] + ', поддерживается ' + STATE_V);
 
   var s = blankState();
   var h = parts[1].split(',');
+  /* 6 полей — заголовок до появления этапов разговора */
+  if (h.length === 6) h = h.concat(['0', '0', '0']);
   if (h.length !== 9) throw new Error('повреждён заголовок состояния');
   s.day = clamp(p36(h[0]) || 1, 1, TOTAL_DAYS);
   s.sound = p36(h[1]) !== 0;
@@ -261,12 +410,25 @@ function decodeState(str) {
     var a = chunk.split(',');
     if (a.length !== 6) throw new Error('повреждена запись карточки: ' + chunk);
     var id = p36(a[0]);
-    if (id < 0 || id >= CARDS.length) throw new Error('карточка вне колоды: ' + id);
+    if (id < 0 || id >= CARDS.length + s.extra.length)
+      throw new Error('карточка вне колоды: ' + id);
     s.cards[id] = {
       due: p36(a[1]), ivl: p36(a[2]),
       ef: clamp(p36(a[3]) || 250, 130, 400),
       reps: p36(a[4]), lapses: p36(a[5])
     };
+  });
+
+  if (parts[5]) parts[5].split(';').forEach(function (chunk) {
+    var a = chunk.split(',');
+    if (a.length !== 3) throw new Error('повреждена запись разбора: ' + chunk);
+    s.rev.push({ d: p36(a[0]), w: dec(a[1]), r: dec(a[2]) });
+  });
+
+  if (parts[6]) parts[6].split(';').forEach(function (chunk) {
+    var a = chunk.split(',');
+    if (a.length !== 3) throw new Error('повреждена запись карточки из разговора: ' + chunk);
+    s.extra.push({ d: p36(a[0]), en: dec(a[1]), ru: dec(a[2]) });
   });
 
   /* newScan — только подсказка, восстанавливаем честно */
@@ -589,6 +751,7 @@ function minutesAfter(stages, idx) {
   var sum = 0;
   for (var i = idx + 1; i < stages.length; i++) {
     var l = stages[i].label;
+    if (l === REVIEW_LABEL) continue;           /* разбор без таймера */
     sum += (l === 'Talk') ? TALK_MIN : (STAGE_MIN[l] || 10);
   }
   return sum;
@@ -597,6 +760,7 @@ function minutesAfter(stages, idx) {
 /* Длительность этапа в миллисекундах на момент его запуска. */
 function stageDuration(stages, idx, now) {
   var label = stages[idx].label;
+  if (label === REVIEW_LABEL) return 0;
   if (label !== 'Talk') return (STAGE_MIN[label] || 10) * 60000;
 
   var end = new Date(now.getTime());
@@ -606,7 +770,12 @@ function stageDuration(stages, idx, now) {
   return Math.max(TALK_MIN * 60000, target - now.getTime());
 }
 
-function dayStages(d) { return (d && d.stages && d.stages.length) ? d.stages : []; }
+function dayStages(d) {
+  var base = (d && d.stages && d.stages.length) ? d.stages : [];
+  /* LIGHT-вечер разбирать нечего: там задача заснуть под рассказ */
+  if (base.length < 2) return base;
+  return base.concat([{ label: REVIEW_LABEL, prompt: REVIEW_PROMPT }]);
+}
 
 /* У LIGHT-вечера один этап и он без таймера: там задача — заснуть. */
 function stageHasTimer(stages) { return stages.length > 1; }
@@ -680,7 +849,7 @@ function renderToday() {
   var q = buildQueue(S, TODAY);
   var left = q.all.length;
   var cardsDone = left === 0;
-  var promptDone = (S.evDate === TODAY && S.evStage >= stagesCount(d));
+  var promptDone = (S.evDate === TODAY && S.evStage > stagesCount(d));
 
   var stages = dayStages(d);
   var conv = renderConversation(d, stages);
@@ -765,13 +934,36 @@ function renderConversation(d, stages) {
   }
 
   /* все этапы пройдены */
-  if (idx >= stages.length) {
+  if (idx > stages.length) {
     return '<p class="step__note">Все этапы пройдены. Скажи «Finish».</p>';
   }
 
   var st = stages[idx - 1];
   var running = stageRunning();
-  var timed = stageHasTimer(stages);
+  var timed = stageHasTimer(stages) && st.label !== REVIEW_LABEL;
+
+  if (st.label === REVIEW_LABEL) {
+    var saved = reviewSavedToday();
+    return '<p class="step__note">Этап ' + idx + ' из ' + stages.length + ' · Разбор</p>' +
+      '<button class="btn btn--accent" style="margin-top:12px" data-act="copy-stage">' +
+        'Скопировать промпт разбора</button>' +
+      '<div id="copyBox"></div>' +
+      '<p class="tiny faint" style="margin-top:10px">Вставь в тот же чат. ' +
+        'Потом скопируй ответ сюда — ошибки уйдут в промпты следующих вечеров.</p>' +
+      (saved
+        ? '<p class="note note--ok">Разбор за сегодня сохранён: ' + saved.m + ' ' +
+            plural(saved.m, 'ошибка', 'ошибки', 'ошибок') + ', ' + saved.w + ' ' +
+            plural(saved.w, 'карточка', 'карточки', 'карточек') + '.</p>'
+        : '<textarea class="ta" id="revArea" spellcheck="false" ' +
+            'placeholder="Вставь разбор от ChatGPT сюда"></textarea>' +
+          '<div class="btn-row" style="margin-top:8px">' +
+            '<button class="btn btn--sm" data-act="save-review">Сохранить</button>' +
+            '<button class="btn btn--sm btn--ghost" data-act="conv-next">Пропустить</button>' +
+          '</div>' +
+          '<div id="revNote"></div>') +
+      (saved ? '<button class="btn btn--sm btn--ghost" style="margin-top:12px" ' +
+                 'data-act="conv-next">Дальше</button>' : '');
+  }
 
   return '<p class="step__note">Этап ' + idx + ' из ' + stages.length + ' · ' + esc(st.label) + '</p>' +
     '<button class="btn btn--accent" style="margin-top:12px" data-act="copy-stage">' +
@@ -792,6 +984,37 @@ function renderConversation(d, stages) {
             (idx + 1 <= stages.length ? 'Дальше: ' + esc(stages[idx].label) : 'Дальше') + '</button>'
         : '<button class="btn btn--sm" data-act="conv-next">Закончить этапы</button>') +
     '</div>';
+}
+
+
+/* Сколько сохранено за сегодня — чтобы не предлагать сохранить дважды. */
+function reviewSavedToday() {
+  var m = 0, w = 0;
+  (S.rev || []).forEach(function (x) { if (x.d === TODAY) m++; });
+  (S.extra || []).forEach(function (x) { if (x.d === TODAY) w++; });
+  return (m || w) ? { m: m, w: w } : null;
+}
+
+function onSaveReview() {
+  var area = el('revArea');
+  var note = el('revNote');
+  if (!area) return;
+  var text = (area.value || '').trim();
+  if (!text) {
+    if (note) note.innerHTML = '<p class="note">Пусто. Можно пропустить — вечер это не сломает.</p>';
+    return;
+  }
+  var parsed = parseReview(text);
+  if (!parsed.mistakes.length && !parsed.words.length) {
+    if (note) note.innerHTML = '<p class="note note--warn">Не нашёл ни одной строки со стрелкой. ' +
+      'Формат: ошибка \u2192 правильно.</p>';
+    Sound.again();
+    return;
+  }
+  var res = saveReview(S, TODAY, parsed);
+  Store.save(S, true);
+  Sound.good();
+  renderToday();
 }
 
 /* ---- таймер этапа: без обратного отсчёта на экране ---- */
@@ -824,7 +1047,8 @@ function buzz() {
 function startStage(idx) {
   var d = dayByNumber(S.day);
   var stages = dayStages(d);
-  if (!stages.length || idx > stages.length) return;
+  /* stages.length + 1 — состояние «все этапы пройдены», оно допустимо */
+  if (!stages.length || idx > stages.length + 1) return;
   S.evDate = TODAY;
   S.evStage = idx;
   if (idx >= 1 && idx <= stages.length && stageHasTimer(stages)) {
@@ -844,6 +1068,7 @@ function onCopyStage() {
   var idx = currentStage();
   if (!stages.length || idx < 1 || idx > stages.length) return;
   var text = stages[idx - 1].prompt;
+  if (idx === 1) text = withMistakes(text, S, TODAY);
   copyText(text, function (ok) {
     S.cpDate = TODAY;
     Store.save(S, true);
@@ -989,7 +1214,8 @@ function renderCards() {
 
   var counts = buildQueue(S, TODAY);
   var id = q[0];
-  var card = CARDS[id];
+  var card = cardAt(S, id);
+  if (!card) return;
   var passed = Math.max(0, dayTotal - q.length);
   var pct = dayTotal ? Math.round(passed / dayTotal * 100) : 0;
 
@@ -1164,7 +1390,7 @@ function renderProgress() {
 
     '<div class="panel gap-lg">' +
       '<div class="row"><div><div class="row__k">Карточек в работе</div>' +
-        '<div class="row__sub">из ' + CARDS.length + ' в колоде</div></div>' +
+        '<div class="row__sub">из ' + cardCount(S) + ' в колоде</div></div>' +
         '<div class="stat__v" style="font-size:22px">' + st.inWork + '</div></div>' +
       '<div class="row"><div><div class="row__k">Засыпание</div>' +
         '<div class="row__sub">среднее из 5, за 7 и 30 дней</div></div>' +
@@ -1380,6 +1606,7 @@ function onAction(e) {
   else if (a === 'conv-start') startStage(1);
   else if (a === 'conv-next') startStage(currentStage() + 1);
   else if (a === 'copy-stage') onCopyStage();
+  else if (a === 'save-review') onSaveReview();
   else if (a === 'finish') doFinish();
   else if (a === 'flip') { if (!flipped) { flipped = true; Sound.flip(); renderCards(); } }
   else if (a === 'grade') answerCard(parseInt(t.getAttribute('data-g'), 10));
@@ -1515,6 +1742,9 @@ var API = {
 
   freshCard: freshCard, sm2: sm2,
   newAllowance: newAllowance, pickNew: pickNew, buildQueue: buildQueue,
+  parseReview: parseReview, saveReview: saveReview, recentMistakes: recentMistakes,
+  withMistakes: withMistakes, cardCount: cardCount, cardAt: cardAt,
+  reviewKey: reviewKey, REVIEW_MAX: REVIEW_MAX, REVIEW_DAYS: REVIEW_DAYS,
   registerAnswer: registerAnswer, computeStats: computeStats,
   blankState: blankState, encodeState: encodeState, decodeState: decodeState,
   checksum: checksum, utf8len: utf8len
