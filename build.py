@@ -210,6 +210,7 @@ def parse_deck(text):
             "ru": ru,
             "tag": tag,
             "day": int(tag.split("_d")[1]),
+            "week": int(tag[1:3]),
         })
 
     seen_day, order = {}, []

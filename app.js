@@ -525,6 +525,47 @@ function plural(n, one, few, many) {
   return many;
 }
 
+
+/* Значки тем по неделям плана. Рисуем линиями через currentColor: вектор,
+   масштабируется, красится темой, ничего не грузится из сети.
+   Колода на 88% — грамматические обороты и связки («In spite of that, ...»),
+   их нарисовать нельзя, поэтому значок показывает тему недели, а не фразу. */
+var ICON_ATTRS = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"';
+
+var WEEK_ICONS = {
+  1:  '<rect x="3.5" y="8" width="17" height="11.5" rx="2"/><path d="M9 8V6a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/><path d="M12 8v11.5"/>',
+  2:  '<circle cx="12" cy="12" r="8.2"/><path d="M8.3 12.3l2.6 2.6 4.8-5.2"/>',
+  3:  '<path d="M7 15.5a3.6 3.6 0 0 1 .5-7.15 4.7 4.7 0 0 1 8.9 1.35A3.2 3.2 0 0 1 16.6 15.5z"/><path d="M9 18.5v1.6M12 18.5v2.2M15 18.5v1.6"/>',
+  4:  '<path d="M12 20s-7-4.4-7-9.2A3.7 3.7 0 0 1 12 8.2a3.7 3.7 0 0 1 7 2.6C19 15.6 12 20 12 20z"/>',
+  5:  '<circle cx="12" cy="12" r="8.2"/><path d="M12 7.2V12l3.3 2"/>',
+  6:  '<rect x="4" y="5.5" width="16" height="11" rx="1.8"/><path d="M2.5 19.5h19"/>',
+  7:  '<path d="M12 6.8C10.8 5.7 9 5.2 6.4 5.2H3.8v12.6h2.6c2.6 0 4.4.5 5.6 1.6 1.2-1.1 3-1.6 5.6-1.6h2.6V5.2h-2.6c-2.6 0-4.4.5-5.6 1.6z"/><path d="M12 6.8v12.6"/>',
+  8:  '<rect x="5" y="4.2" width="14" height="16.6" rx="2"/><rect x="9" y="2.2" width="6" height="4" rx="1.2"/><path d="M8.6 11.5h6.8M8.6 15.2h4.2"/>',
+  9:  '<circle cx="12" cy="12" r="8.2"/><path d="M9.7 9.8a2.4 2.4 0 1 1 3.2 2.3c-.6.3-.9.8-.9 1.4v.5"/><circle cx="12" cy="16.6" r="0.9" fill="currentColor" stroke="none"/>',
+  10: '<path d="M3.2 20.5h17.6"/><rect x="4" y="10" width="6" height="10.5"/><rect x="13" y="4.5" width="7" height="16"/><path d="M6 13h2M6 16h2M15.2 8h2.6M15.2 11.5h2.6M15.2 15h2.6"/>',
+  11: '<path d="M4.5 10.5A7.6 7.6 0 0 1 18 8"/><path d="M4.5 6.5v4h4"/><path d="M19.5 13.5A7.6 7.6 0 0 1 6 16"/><path d="M19.5 17.5v-4h-4"/>',
+  12: '<circle cx="12" cy="12" r="8.2"/><circle cx="12" cy="12" r="4.4"/><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/>',
+  13: '<circle cx="9.5" cy="9" r="3.2"/><path d="M9.5 3.2v1.4M9.5 13.4v1.4M3.7 9h1.4M13.9 9h1.4M5.4 4.9l1 1M12.6 12.1l1 1M13.6 4.9l-1 1M6.4 12.1l-1 1"/><path d="M11.5 20.5a3.4 3.4 0 0 1 .4-6.77 4.4 4.4 0 0 1 8.35 1.27A3 3 0 0 1 19.7 20.5z"/>',
+  14: '<path d="M12 21v-7"/><path d="M12 14L6.4 8.4"/><path d="M12 14l5.6-5.6"/><path d="M6.4 8.4h3.4M6.4 8.4v3.4"/><path d="M17.6 8.4h-3.4M17.6 8.4v3.4"/>',
+  15: '<circle cx="12" cy="8.2" r="3.6"/><path d="M5.2 20.3a6.8 6.8 0 0 1 13.6 0"/>',
+  16: '<rect x="3.5" y="5.5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3.5v4M16 3.5v4"/><path d="M10 15.5h5M13 13.2l2.3 2.3-2.3 2.3"/>',
+  17: '<path d="M3.5 6.5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H8l-3.5 2.8V12.5a2 2 0 0 1-1-1.7z"/><path d="M18 9.5h.5a2 2 0 0 1 2 2v4a2 2 0 0 1-1 1.7v2.6L16 17h-3"/>',
+  18: '<path d="M4.5 12a7.6 7.6 0 1 0 2.3-5.4"/><path d="M3.5 4.5v4.2h4.2"/><path d="M12 8.4V12l2.6 1.8"/>',
+  19: '<path d="M12 4.2v16.3M7 20.5h10"/><path d="M4 9.5h16"/><path d="M4 9.5L1.8 14a2.6 2.6 0 0 0 4.4 0z"/><path d="M20 9.5L17.8 14a2.6 2.6 0 0 0 4.4 0z"/>',
+  20: '<path d="M4.5 12a7.5 7.5 0 0 1 15 0"/><rect x="2.8" y="12" width="3.6" height="5.6" rx="1.6"/><rect x="17.6" y="12" width="3.6" height="5.6" rx="1.6"/><path d="M19.4 17.6v.9a2.4 2.4 0 0 1-2.4 2.4h-2.6"/>',
+  21: '<path d="M2.8 18.6h18.4"/><path d="M7.4 18.6a4.6 4.6 0 0 1 9.2 0"/><path d="M12 5v2.5M5.6 7.6l1.8 1.8M18.4 7.6l-1.8 1.8M2.6 13.9h2.3M19.1 13.9h2.3"/>',
+  22: '<ellipse cx="12" cy="6.6" rx="7" ry="2.6"/><path d="M5 6.6v4.4c0 1.44 3.13 2.6 7 2.6s7-1.16 7-2.6V6.6"/><path d="M5 11v4.4c0 1.44 3.13 2.6 7 2.6s7-1.16 7-2.6V11"/>',
+  23: '<path d="M3.5 20.5h17"/><rect x="4.5" y="12" width="4.6" height="8.5"/><rect x="14.9" y="6" width="4.6" height="14.5"/><path d="M11.8 9.5h1M11.8 13h1M11.8 16.5h1"/>',
+  24: '<path d="M2.8 18.5l5.4-8.2 3.4 4.6 2.6-3.4 7 7z"/><path d="M6.6 5.2v5.6"/><path d="M6.6 5.2l4.2 1.3-4.2 1.4"/>'
+};
+
+function weekIcon(week) {
+  var body = WEEK_ICONS[week];
+  if (!body) return '';
+  return '<svg class="flash__icon" ' + ICON_ATTRS + ' aria-hidden="true">' + body + '</svg>';
+}
+
 var CHECK_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" ' +
   'd="M9.6 17.2 4.4 12l1.6-1.6 3.6 3.6 8-8L19.2 7.6 9.6 17.2Z"/></svg>';
 
@@ -836,6 +877,7 @@ function renderCards() {
     '</div>' +
 
     '<div class="flash" data-act="flip">' +
+      weekIcon(card.week) +
       '<div class="flash__en">' + esc(card.en) + '</div>' +
       (flipped
         ? '<div class="flash__ru">' + esc(card.ru) + '</div>'
