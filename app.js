@@ -1,0 +1,1352 @@
+/* Вечерний английский — Telegram Mini App.
+   Без фреймворков и сборки. data.js должен быть подключён раньше. */
+(function (global) {
+'use strict';
+
+/* =====================================================================
+   1. КОНСТАНТЫ И ЧИСТАЯ ЛОГИКА  (не трогает DOM и Telegram)
+   ===================================================================== */
+
+var DAY_MS = 86400000;
+var BASE_UTC = Date.UTC(2026, 0, 1);   /* dateNum 1 == 2026-01-01, 0 == «никогда» */
+var CUTOFF_H = 3;                      /* сутки приложения идут с 03:00 до 03:00 */
+var NEW_PER_DAY = 6;
+var LEARNED_IVL = 21;                  /* карточка считается выученной */
+var MAX_IVL = 36500;                   /* 100 лет — дальше расти незачем */
+var TOTAL_DAYS = 168;
+var STATE_V = 1;
+var EVENING_H = 22;                    /* с этого часа вкладка «Сегодня» — вечерняя */
+
+/* кнопки «Во сколько лёг»: индекс -> минуты от 22:00 */
+var BED_MIN = [30, 60, 90, 120, 150];
+var BED_LABEL = ['22:30', '23:00', '23:30', '00:00', 'позже'];
+
+var DAYS = global.DAYS || [];
+var CARDS = global.CARDS || [];
+
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function numAsc(a, b) { return a - b; }
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+/* ---------------------------------------------------------------- даты */
+
+function dateNumOf(y, m, d) {
+  return Math.round((Date.UTC(y, m, d) - BASE_UTC) / DAY_MS) + 1;
+}
+
+/* Логическая дата: Finish в 00:30 относится ко вчерашнему вечеру. */
+function logicalDate(now) {
+  var t = new Date(now.getTime() - CUTOFF_H * 3600000);
+  return dateNumOf(t.getFullYear(), t.getMonth(), t.getDate());
+}
+
+function dateParts(n) {
+  var d = new Date(BASE_UTC + (n - 1) * DAY_MS);
+  return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate(), wd: d.getUTCDay() };
+}
+
+function dateISO(n) {
+  var p = dateParts(n);
+  return p.y + '-' + pad2(p.m + 1) + '-' + pad2(p.d);
+}
+
+function minutesToClock(min) {
+  var t = Math.round(min) + 22 * 60;
+  return pad2(Math.floor(t / 60) % 24) + ':' + pad2(t % 60);
+}
+
+/* ---------------------------------------------------------------- SM-2 */
+/* Оценки: 0 Снова, 1 Трудно, 2 Хорошо, 3 Легко.
+   Старт ease 2.50, интервалы 1 -> 6 -> interval * ease, «Снова» сбрасывает. */
+
+function freshCard() { return { due: 0, ivl: 0, ef: 250, reps: 0, lapses: 0 }; }
+
+function sm2(st, grade, today) {
+  var s = { due: st.due, ivl: st.ivl, ef: st.ef, reps: st.reps, lapses: st.lapses };
+
+  if (grade === 0) {
+    s.reps = 0;
+    s.ivl = 0;
+    s.lapses += 1;
+    s.ef = Math.max(130, s.ef - 20);
+    s.due = today;                       /* вернётся в этой же очереди */
+    return s;
+  }
+
+  if (grade === 1) s.ef = Math.max(130, s.ef - 15);
+  else if (grade === 3) s.ef = Math.min(400, s.ef + 15);
+
+  if (s.reps === 0) {
+    s.ivl = (grade === 3) ? 3 : 1;
+  } else if (s.reps === 1) {
+    s.ivl = (grade === 1) ? 3 : (grade === 3 ? 8 : 6);
+  } else {
+    var f = (grade === 1) ? 1.2 : (grade === 3 ? (s.ef / 100) * 1.3 : s.ef / 100);
+    s.ivl = Math.max(s.ivl + 1, Math.round(s.ivl * f));
+  }
+  s.reps += 1;
+  if (s.ivl > MAX_IVL) s.ivl = MAX_IVL;
+  s.due = today + s.ivl;
+  return s;
+}
+
+/* ------------------------------------------------------------- очередь */
+
+function newAllowance(state, today) {
+  var used = (state.newDate === today) ? state.newCount : 0;
+  return Math.max(0, NEW_PER_DAY - used);
+}
+
+/* Следующие невыданные карточки строго по порядку колоды. */
+function pickNew(state, limit) {
+  var out = [];
+  var i = state.newScan || 0;
+  while (i < CARDS.length && out.length < limit) {
+    if (!state.cards[i]) out.push(i);
+    i++;
+  }
+  return out;
+}
+
+function buildQueue(state, today) {
+  var reviews = [];
+  for (var k in state.cards) {
+    if (!Object.prototype.hasOwnProperty.call(state.cards, k)) continue;
+    if (state.cards[k].due <= today) reviews.push(+k);
+  }
+  reviews.sort(function (a, b) {
+    var da = state.cards[a].due, db = state.cards[b].due;
+    return da !== db ? da - db : a - b;
+  });
+  var news = pickNew(state, newAllowance(state, today));
+  return { reviews: reviews, news: news, all: reviews.concat(news) };
+}
+
+/* Первый ответ по карточке = она «выдана». Считаем новые за дату. */
+function registerAnswer(state, id, grade, today) {
+  var isNew = !state.cards[id];
+  var before = state.cards[id] || freshCard();
+  state.cards[id] = sm2(before, grade, today);
+  if (isNew) {
+    if (state.newDate !== today) { state.newDate = today; state.newCount = 0; }
+    state.newCount += 1;
+    while (state.newScan < CARDS.length && state.cards[state.newScan]) state.newScan++;
+  }
+  return state.cards[id];
+}
+
+/* ------------------------------------------------------------ статистика */
+
+function countDoneIn(state, today, span) {
+  var n = 0;
+  for (var d = today - span + 1; d <= today; d++) if (state.fin[d] != null) n++;
+  return n;
+}
+
+function streakDays(state, today) {
+  var start = (state.fin[today] != null) ? today : today - 1;
+  var n = 0;
+  while (state.fin[start] != null) { n++; start--; }
+  return n;
+}
+
+function avgIn(state, today, span, pick) {
+  var sum = 0, n = 0;
+  for (var d = today - span + 1; d <= today; d++) {
+    var a = state.mrn[d];
+    if (a) { sum += pick(a); n++; }
+  }
+  return n ? { avg: sum / n, n: n } : { avg: null, n: 0 };
+}
+
+function computeStats(state, today) {
+  var learned = 0, inWork = 0;
+  for (var k in state.cards) {
+    if (!Object.prototype.hasOwnProperty.call(state.cards, k)) continue;
+    inWork++;
+    if (state.cards[k].ivl >= LEARNED_IVL) learned++;
+  }
+  var series = [];
+  for (var d = today - 29; d <= today; d++) {
+    var a = state.mrn[d];
+    series.push({ date: d, speed: a ? a[0] : null, bed: a ? a[1] : null });
+  }
+  return {
+    done7: countDoneIn(state, today, 7),
+    done30: countDoneIn(state, today, 30),
+    streak: streakDays(state, today),
+    learned: learned,
+    inWork: inWork,
+    speed7: avgIn(state, today, 7, function (a) { return a[0]; }),
+    speed30: avgIn(state, today, 30, function (a) { return a[0]; }),
+    bed7: avgIn(state, today, 7, function (a) { return BED_MIN[a[1]]; }),
+    bed30: avgIn(state, today, 30, function (a) { return BED_MIN[a[1]]; }),
+    series: series
+  };
+}
+
+/* ------------------------------------------ упаковка состояния в строку */
+
+function b36(n) { return Math.round(n).toString(36); }
+function p36(s) { var v = parseInt(s, 36); return isFinite(v) ? v : 0; }
+
+function blankState() {
+  return {
+    day: 1, sound: true, newScan: 0, newDate: 0, newCount: 0, cpDate: 0,
+    fin: {}, mrn: {}, cards: {}
+  };
+}
+
+function encodeState(s) {
+  var head = [s.day, s.sound ? 1 : 0, s.newScan, s.newDate, s.newCount, s.cpDate || 0]
+    .map(b36).join(',');
+
+  var fin = Object.keys(s.fin).map(Number).sort(numAsc).map(function (d) {
+    return b36(d) + ',' + b36(s.fin[d]);
+  }).join(';');
+
+  var mrn = Object.keys(s.mrn).map(Number).sort(numAsc).map(function (d) {
+    return b36(d) + ',' + b36(s.mrn[d][0]) + ',' + b36(s.mrn[d][1]);
+  }).join(';');
+
+  var crd = Object.keys(s.cards).map(Number).sort(numAsc).map(function (i) {
+    var c = s.cards[i];
+    return b36(i) + ',' + b36(c.due) + ',' + b36(c.ivl) + ',' +
+           b36(c.ef) + ',' + b36(c.reps) + ',' + b36(c.lapses);
+  }).join(';');
+
+  return [STATE_V, head, fin, mrn, crd].join('\n');
+}
+
+function decodeState(str) {
+  if (typeof str !== 'string' || !str) throw new Error('пустое состояние');
+  var parts = str.split('\n');
+  if (parts.length !== 5) throw new Error('ожидалось 5 секций, получено ' + parts.length);
+  if (p36(parts[0]) !== STATE_V) throw new Error('версия состояния ' + parts[0] + ', поддерживается ' + STATE_V);
+
+  var s = blankState();
+  var h = parts[1].split(',');
+  if (h.length !== 6) throw new Error('повреждён заголовок состояния');
+  s.day = clamp(p36(h[0]) || 1, 1, TOTAL_DAYS);
+  s.sound = p36(h[1]) !== 0;
+  s.newScan = Math.max(0, p36(h[2]));
+  s.newDate = Math.max(0, p36(h[3]));
+  s.newCount = Math.max(0, p36(h[4]));
+  s.cpDate = Math.max(0, p36(h[5]));
+
+  if (parts[2]) parts[2].split(';').forEach(function (chunk) {
+    var a = chunk.split(',');
+    if (a.length !== 2) throw new Error('повреждена запись сделанного дня: ' + chunk);
+    s.fin[p36(a[0])] = p36(a[1]);
+  });
+
+  if (parts[3]) parts[3].split(';').forEach(function (chunk) {
+    var a = chunk.split(',');
+    if (a.length !== 3) throw new Error('повреждена запись утра: ' + chunk);
+    s.mrn[p36(a[0])] = [clamp(p36(a[1]), 1, 5), clamp(p36(a[2]), 0, BED_MIN.length - 1)];
+  });
+
+  if (parts[4]) parts[4].split(';').forEach(function (chunk) {
+    var a = chunk.split(',');
+    if (a.length !== 6) throw new Error('повреждена запись карточки: ' + chunk);
+    var id = p36(a[0]);
+    if (id < 0 || id >= CARDS.length) throw new Error('карточка вне колоды: ' + id);
+    s.cards[id] = {
+      due: p36(a[1]), ivl: p36(a[2]),
+      ef: clamp(p36(a[3]) || 250, 130, 400),
+      reps: p36(a[4]), lapses: p36(a[5])
+    };
+  });
+
+  /* newScan — только подсказка, восстанавливаем честно */
+  s.newScan = 0;
+  while (s.newScan < CARDS.length && s.cards[s.newScan]) s.newScan++;
+  return s;
+}
+
+function checksum(str) {
+  var h = 5381;
+  for (var i = 0; i < str.length; i++) h = ((h * 33) ^ str.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+/* =====================================================================
+   2. ХРАНИЛИЩЕ
+   Состояние пакуется в строку, режется на куски по 3500 символов
+   (лимит значения CloudStorage — 4096 байт, строка чисто ASCII).
+   Пишем в «теневое» поколение ключей, затем одним ключом переключаем
+   манифест — запись атомарна, обрыв не портит сохранённое.
+   ===================================================================== */
+
+var Store = (function () {
+  var CHUNK = 3500;
+  var MANIFEST = 'm';
+  var tg = null;
+  var mem = {};                 /* запасной вариант: localStorage / память */
+
+  function cloud() {
+    if (!tg || !tg.CloudStorage) return null;
+    if (tg.isVersionAtLeast && !tg.isVersionAtLeast('6.9')) return null;
+    return tg.CloudStorage;
+  }
+
+  function lsGet(k) {
+    try { return global.localStorage ? global.localStorage.getItem('ee_' + k) : mem[k] || null; }
+    catch (e) { return mem[k] || null; }
+  }
+  function lsSet(k, v) {
+    mem[k] = v;
+    try { if (global.localStorage) global.localStorage.setItem('ee_' + k, v); } catch (e) {}
+  }
+
+  function getItems(keys, cb) {
+    var cs = cloud();
+    if (!cs) {
+      var out = {};
+      keys.forEach(function (k) { out[k] = lsGet(k); });
+      return setTimeout(function () { cb(null, out); }, 0);
+    }
+    cs.getItems(keys, function (err, vals) { cb(err || null, vals || {}); });
+  }
+
+  function setItems(pairs, cb) {
+    var cs = cloud();
+    var keys = Object.keys(pairs);
+    if (!keys.length) return cb(null);
+    if (!cs) {
+      keys.forEach(function (k) { lsSet(k, pairs[k]); });
+      return setTimeout(function () { cb(null); }, 0);
+    }
+    var left = keys.length, failed = null;
+    keys.forEach(function (k) {
+      cs.setItem(k, pairs[k], function (err, ok) {
+        if (err || ok === false) failed = err || new Error('CloudStorage отказал на ключе ' + k);
+        if (--left === 0) cb(failed);
+      });
+    });
+  }
+
+  function split(str) {
+    var out = [];
+    for (var i = 0; i < str.length; i += CHUNK) out.push(str.slice(i, i + CHUNK));
+    return out.length ? out : [''];
+  }
+
+  function manifestFor(gen, chunks, str) {
+    return { g: gen, n: chunks.length, len: str.length, ck: checksum(str) };
+  }
+
+  function assemble(man, vals) {
+    var parts = [];
+    for (var i = 0; i < man.n; i++) {
+      var v = vals[man.g + i];
+      if (v == null) return null;
+      parts.push(v);
+    }
+    var str = parts.join('');
+    if (str.length !== man.len || checksum(str) !== man.ck) return null;
+    return str;
+  }
+
+  var current = null;           /* последний успешно записанный манифест */
+  var pending = null, timer = null, inFlight = false, again = false;
+
+  function writeNow(state, done) {
+    var str = encodeState(state);
+    var gen = (current && current.g === 'a') ? 'b' : 'a';
+    var chunks = split(str);
+    var man = manifestFor(gen, chunks, str);
+
+    var pairs = {};
+    chunks.forEach(function (c, i) { pairs[gen + i] = c; });
+
+    inFlight = true;
+    setItems(pairs, function (err) {
+      if (err) { inFlight = false; return done && done(err); }
+      var payload = { g: man.g, n: man.n, len: man.len, ck: man.ck };
+      if (current) payload.p = { g: current.g, n: current.n, len: current.len, ck: current.ck };
+      setItems({ m: JSON.stringify(payload) }, function (err2) {
+        inFlight = false;
+        if (!err2) current = man;
+        if (again) { again = false; schedule(pending, 0); }
+        done && done(err2 || null);
+      });
+    });
+  }
+
+  function schedule(state, delay) {
+    pending = state;
+    if (inFlight) { again = true; return; }
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(function () { timer = null; writeNow(pending); }, delay);
+  }
+
+  return {
+    attach: function (t) { tg = t; },
+
+    load: function (cb) {
+      getItems([MANIFEST], function (err, vals) {
+        if (err || !vals[MANIFEST]) return cb(null, blankState(), 'new');
+        var man;
+        try { man = JSON.parse(vals[MANIFEST]); } catch (e) { return cb(null, blankState(), 'new'); }
+        if (!man || !man.g || !man.n) return cb(null, blankState(), 'new');
+
+        var keys = [], i;
+        for (i = 0; i < man.n; i++) keys.push(man.g + i);
+        if (man.p) for (i = 0; i < man.p.n; i++) keys.push(man.p.g + i);
+
+        getItems(keys, function (err2, vals2) {
+          if (err2) return cb(err2, blankState(), 'error');
+          var str = assemble(man, vals2);
+          var used = man;
+          if (str == null && man.p) { str = assemble(man.p, vals2); used = man.p; }
+          if (str == null) return cb(null, blankState(), 'corrupt');
+          try {
+            var st = decodeState(str);
+            current = used;
+            return cb(null, st, used === man ? 'ok' : 'recovered');
+          } catch (e) {
+            return cb(null, blankState(), 'corrupt');
+          }
+        });
+      });
+    },
+
+    save: function (state, force, done) {
+      if (force) {
+        if (timer) { clearTimeout(timer); timer = null; }
+        if (inFlight) { pending = state; again = true; return done && done(null); }
+        return writeNow(state, done);
+      }
+      schedule(state, 2500);
+    },
+
+    /* для проверки лимитов в настройках */
+    describe: function (state) {
+      var str = encodeState(state);
+      var n = split(str).length;
+      return { bytes: str.length, chunks: n, keys: n * 2 + 1, cloud: !!cloud() };
+    }
+  };
+})();
+
+/* =====================================================================
+   3. ЗВУК  — короткие синтезированные тона, без внешних файлов
+   ===================================================================== */
+
+var Sound = (function () {
+  var ctx = null, on = true;
+
+  function ac() {
+    if (ctx) return ctx;
+    var C = global.AudioContext || global.webkitAudioContext;
+    if (!C) return null;
+    try { ctx = new C(); } catch (e) { return null; }
+    return ctx;
+  }
+
+  function beep(freq, at, dur, vol, type) {
+    var c = ac();
+    if (!c) return;
+    var t0 = c.currentTime + at;
+    var o = c.createOscillator(), g = c.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(freq, t0);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(c.destination);
+    o.start(t0); o.stop(t0 + dur + 0.03);
+  }
+
+  function play(notes) {
+    if (!on) return;
+    var c = ac();
+    if (!c) return;
+    if (c.state === 'suspended' && c.resume) c.resume();
+    notes.forEach(function (n) { beep(n[0], n[1], n[2], n[3], n[4]); });
+  }
+
+  return {
+    setOn: function (v) { on = !!v; },
+    isOn: function () { return on; },
+    unlock: function () { var c = ac(); if (c && c.state === 'suspended' && c.resume) c.resume(); },
+    tap:    function () { play([[520, 0, 0.05, 0.05]]); },
+    flip:   function () { play([[430, 0, 0.07, 0.055]]); },
+    good:   function () { play([[660, 0, 0.09, 0.07], [880, 0.07, 0.11, 0.055]]); },
+    again:  function () { play([[300, 0, 0.13, 0.06, 'triangle']]); },
+    done:   function () { play([[523, 0, 0.12, 0.06], [659, 0.1, 0.12, 0.06], [784, 0.2, 0.26, 0.055]]); },
+    finish: function () {
+      play([[392, 0, 0.35, 0.055], [294, 0.3, 0.4, 0.05], [196, 0.65, 0.9, 0.045]]);
+    }
+  };
+})();
+
+/* =====================================================================
+   4. ИНТЕРФЕЙС
+   ===================================================================== */
+
+var S = blankState();       /* состояние */
+var TODAY = 0;              /* логическая дата */
+var tab = 'today';
+var tg = null;
+var dayTotal = 0;           /* размер очереди на начало сессии карточек */
+var deferred = [];          /* карточки, по которым нажали «Снова» */
+var flipped = false;
+var pendingMorning = { speed: null, bed: null };
+var curtainDismissed = false;   /* занавес закрыли тапом — показываем «Сегодня закрыто» */
+
+function el(id) { return global.document.getElementById(id); }
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function (m) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m];
+  });
+}
+
+var MON_RU = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+              'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+
+function humanDate(n) {
+  var p = dateParts(n);
+  return p.d + ' ' + MON_RU[p.m];
+}
+
+function dayByNumber(n) {
+  for (var i = 0; i < DAYS.length; i++) if (DAYS[i].n === n) return DAYS[i];
+  return null;
+}
+
+function plural(n, one, few, many) {
+  var a = Math.abs(n) % 100, b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b > 1 && b < 5) return few;
+  if (b === 1) return one;
+  return many;
+}
+
+var CHECK_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" ' +
+  'd="M9.6 17.2 4.4 12l1.6-1.6 3.6 3.6 8-8L19.2 7.6 9.6 17.2Z"/></svg>';
+
+/* ------------------------------------------------------------- вкладки */
+
+function go(name) {
+  tab = name;
+  ['today', 'cards', 'morning', 'progress'].forEach(function (t) {
+    el('screen-' + t).hidden = (t !== name);
+  });
+  var tabs = el('tabbar').querySelectorAll('.tab');
+  for (var i = 0; i < tabs.length; i++) {
+    tabs[i].classList.toggle('is-active', tabs[i].getAttribute('data-go') === name);
+  }
+  el('topTitle').textContent =
+    { today: 'Сегодня', cards: 'Карточки', morning: 'Утро', progress: 'Прогресс' }[name];
+  render();
+}
+
+function render() {
+  if (tab === 'today') renderToday();
+  else if (tab === 'cards') renderCards();
+  else if (tab === 'morning') renderMorning(el('morningBody'), false);
+  else renderProgress();
+}
+
+/* --------------------------------------------------------------- утро? */
+
+function morningTarget() { return TODAY - 1; }
+
+/* Спрашиваем, только если вчера был закрытый вечер и ответа ещё нет.
+   В вечерние часы вопрос не мешает — вкладка сразу показывает вечер. */
+function needMorning() {
+  var t = morningTarget();
+  if (S.mrn[t]) return false;
+  if (S.fin[t] == null) return false;
+  return new Date().getHours() < EVENING_H;
+}
+
+/* ------------------------------------------------------------- СЕГОДНЯ */
+
+function isNight() {
+  var h = new Date().getHours();
+  return h >= EVENING_H - 1 || h < CUTOFF_H;
+}
+
+function renderToday() {
+  var box = el('todayBody');
+
+  if (needMorning()) { renderMorning(box, true); return; }
+
+  if (S.fin[TODAY] != null) {
+    if (isNight() && !curtainDismissed) { showCurtain(false); return; }
+    box.innerHTML =
+      '<div class="gap-xl center stack">' +
+        '<div class="h1">Сегодня закрыто</div>' +
+        '<p class="sub">День ' + esc(S.fin[TODAY]) + ' сделан. ' +
+        'Следующий откроется завтра.</p>' +
+      '</div>';
+    return;
+  }
+
+  var d = dayByNumber(S.day);
+  if (!d) {
+    box.innerHTML = '<div class="gap-xl center stack"><div class="h1">План пройден</div>' +
+      '<p class="sub">168 вечеров позади.</p></div>';
+    return;
+  }
+
+  var q = buildQueue(S, TODAY);
+  var left = q.all.length;
+  var cardsDone = left === 0;
+  var promptDone = S.cpDate === TODAY;
+
+  var tl = d.voice.map(function (st, i) {
+    return '<li class="tl__row"><span class="tl__dot"></span>' +
+      '<span class="tl__time">' + esc(st.time) + '</span>' +
+      '<span class="tl__label">' + esc(st.label) + '</span></li>';
+  }).join('');
+
+  box.innerHTML =
+    '<div class="chip">' + esc(d.type) + ' · ' + esc(d.typeLabel) + '</div>' +
+    '<div class="h1">День ' + d.n + '</div>' +
+    '<p class="sub">Неделя ' + d.week + ' · ' + esc(d.weekday.toLowerCase()) + '</p>' +
+
+    '<div class="panel gap-lg">' +
+      '<p class="tiny faint">ТЕМА</p>' +
+      '<p style="margin:2px 0 0;font-size:17px">' + esc(d.topic) + '</p>' +
+      '<p class="tiny faint" style="margin-top:14px">ГРАММАТИКА НЕДЕЛИ</p>' +
+      '<p style="margin:2px 0 0;font-size:15px" class="dim">' + esc(d.grammar) + '</p>' +
+    '</div>' +
+
+    '<div class="gap-lg">' +
+
+      '<div class="step' + (cardsDone ? ' is-done' : '') + '">' +
+        '<span class="step__mark">' + CHECK_SVG + '</span>' +
+        '<div class="step__body">' +
+          '<p class="step__title">Карточки</p>' +
+          '<p class="step__note">' +
+            (cardsDone ? 'Очередь на сегодня пуста'
+                       : q.news.length + ' ' + plural(q.news.length, 'новая', 'новых', 'новых') +
+                         ' · ' + q.reviews.length + ' ' +
+                         plural(q.reviews.length, 'повтор', 'повтора', 'повторов')) +
+          '</p>' +
+          (cardsDone ? '' :
+            '<button class="btn btn--sm" style="margin-top:12px" data-act="open-cards">Открыть карточки</button>') +
+        '</div>' +
+      '</div>' +
+
+      '<div class="step' + (promptDone ? ' is-done' : '') + '">' +
+        '<span class="step__mark">' + CHECK_SVG + '</span>' +
+        '<div class="step__body">' +
+          '<p class="step__title">Промпт</p>' +
+          '<p class="step__note">' +
+            (promptDone ? 'Скопирован — вставь в новый чат' : 'Для нового чата в ChatGPT') + '</p>' +
+          '<button class="btn btn--accent" style="margin-top:12px" data-act="copy-prompt">' +
+            (promptDone ? 'Скопировать ещё раз' : 'Скопировать промпт') + '</button>' +
+          '<div id="copyBox"></div>' +
+          '<p class="tiny faint" style="margin-top:10px">' +
+            'Новый чат в ChatGPT → вставить → включить голос → телефон экраном вниз</p>' +
+          '<ul class="tl">' + tl + '</ul>' +
+          (d.voiceNote ? '<p class="tiny faint" style="margin-top:6px">' + esc(d.voiceNote) + '</p>' : '') +
+        '</div>' +
+      '</div>' +
+
+      '<div class="step">' +
+        '<span class="step__mark">' + CHECK_SVG + '</span>' +
+        '<div class="step__body">' +
+          '<p class="step__title">Finish</p>' +
+          '<p class="step__note">Закрыть вечер и выключить свет</p>' +
+          '<button class="btn btn--big" style="margin-top:14px" data-act="finish">Finish</button>' +
+        '</div>' +
+      '</div>' +
+
+    '</div>';
+}
+
+/* ------------------------------------------------------ копирование промпта */
+
+function copyText(text, cb) {
+  var nav = global.navigator;
+  if (nav && nav.clipboard && nav.clipboard.writeText) {
+    try {
+      nav.clipboard.writeText(text).then(function () { cb(true); }, function () { legacyCopy(text, cb); });
+      return;
+    } catch (e) { /* дальше */ }
+  }
+  legacyCopy(text, cb);
+}
+
+function legacyCopy(text, cb) {
+  var doc = global.document;
+  var ta = doc.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none;font-size:16px';
+  doc.body.appendChild(ta);
+  var ok = false;
+  try {
+    ta.contentEditable = 'true';
+    ta.readOnly = false;
+    var range = doc.createRange();
+    range.selectNodeContents(ta);
+    var sel = global.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    ta.setSelectionRange(0, text.length);
+    ok = doc.execCommand('copy');
+  } catch (e) { ok = false; }
+  doc.body.removeChild(ta);
+  cb(!!ok);
+}
+
+function onCopyPrompt() {
+  var d = dayByNumber(S.day);
+  if (!d) return;
+  copyText(d.prompt, function (ok) {
+    /* шаг закрывается в обоих случаях: промпт у пользователя либо в буфере,
+       либо выделен на экране для ручного копирования */
+    S.cpDate = TODAY;
+    Store.save(S, true);
+    if (ok) { Sound.good(); }
+    else Sound.again();
+    if (tab === 'today') renderToday();
+    if (ok) return;
+
+    var box = el('copyBox');
+    if (!box) return;
+    box.innerHTML =
+      '<p class="note note--warn">Буфер обмена недоступен. Текст выделен — скопируй вручную:</p>' +
+      '<textarea class="ta" id="copyArea" spellcheck="false"></textarea>';
+    var area = el('copyArea');
+    area.value = d.prompt;
+    area.focus();
+    area.setSelectionRange(0, d.prompt.length);
+  });
+}
+
+/* --------------------------------------------------------------- FINISH */
+
+function doFinish() {
+  if (S.fin[TODAY] != null) return;
+  S.fin[TODAY] = S.day;
+  S.day = Math.min(TOTAL_DAYS, S.day + 1);
+  Sound.finish();
+  Store.save(S, true);
+  showCurtain(true);
+  reportToBot();
+}
+
+/* Тихо отдать боту сводку, чтобы /today и /stats были свежими без ручного экспорта.
+   sendData работает, только если приложение открыто кнопкой клавиатуры, и закрывает
+   приложение — поэтому ждём, пока догорит «Спокойной ночи». Не вышло — не беда,
+   вечер уже записан в CloudStorage. */
+function reportToBot() {
+  if (!tg || typeof tg.sendData !== 'function') return;
+  var msg;
+  try {
+    msg = JSON.stringify({
+      app: 'english-evenings', v: STATE_V, auto: true,
+      exported: new Date().toISOString(),
+      summary: exportSummary()
+    });
+  } catch (e) { return; }
+  if (utf8len(msg) > 4096) return;
+  setTimeout(function () {
+    try { tg.sendData(msg); } catch (e) {}
+  }, 3500);
+}
+
+var curtainAt = 0;
+
+/* показать/снять ночной занавес: «Спокойной ночи» поверх всего */
+function curtain(show, fresh) {
+  el('curtain').hidden = !show;
+  el('tabbar').style.display = show ? 'none' : '';
+  el('screens').style.visibility = show ? 'hidden' : '';
+  el('btnSettings').style.display = show ? 'none' : '';
+  if (show) {
+    curtainAt = Date.now();
+    if (!fresh) el('curtain').style.animation = 'none';
+  } else {
+    el('curtain').style.animation = '';
+  }
+}
+
+function showCurtain(fresh) { curtain(true, fresh); }
+
+
+/* ------------------------------------------------------------ КАРТОЧКИ */
+
+var dayTotal_date = 0;
+var doneSound_date = 0;
+
+function orderedQueue() {
+  var q = buildQueue(S, TODAY).all;
+  if (!deferred.length) return q;
+  var rank = {}, i;
+  for (i = 0; i < deferred.length; i++) rank[deferred[i]] = i + 1;
+  var head = [], tail = [];
+  for (i = 0; i < q.length; i++) (rank[q[i]] ? tail : head).push(q[i]);
+  tail.sort(function (a, b) { return rank[a] - rank[b]; });
+  return head.concat(tail);
+}
+
+function syncDayTotal(len) {
+  if (dayTotal_date !== TODAY) { dayTotal_date = TODAY; dayTotal = len; deferred = []; }
+  if (len > dayTotal) dayTotal = len;
+}
+
+function renderCards() {
+  var box = el('cardsBody');
+  var q = orderedQueue();
+  syncDayTotal(q.length);
+
+  if (!q.length) {
+    if (doneSound_date !== TODAY && dayTotal > 0) { doneSound_date = TODAY; Sound.done(); }
+    box.innerHTML =
+      '<div class="gap-xl center stack">' +
+        '<div class="h1">На сегодня всё</div>' +
+        '<p class="sub">Очередь пуста. Возвращайся завтра.</p>' +
+      '</div>';
+    return;
+  }
+
+  var counts = buildQueue(S, TODAY);
+  var id = q[0];
+  var card = CARDS[id];
+  var passed = Math.max(0, dayTotal - q.length);
+  var pct = dayTotal ? Math.round(passed / dayTotal * 100) : 0;
+
+  var grades = [
+    { g: 0, cls: 'grade--again', label: 'Снова' },
+    { g: 1, cls: '', label: 'Трудно' },
+    { g: 2, cls: 'grade--good', label: 'Хорошо' },
+    { g: 3, cls: '', label: 'Легко' }
+  ].map(function (b) {
+    return '<button class="grade ' + b.cls + '" data-act="grade" data-g="' + b.g + '">' +
+      b.label + '</button>';
+  }).join('');
+
+  box.innerHTML =
+    '<div class="queue">' +
+      '<div class="queue__bar"><div class="queue__fill" style="width:' + pct + '%"></div></div>' +
+      '<div class="queue__meta">' +
+        '<span>осталось ' + q.length + '</span>' +
+        '<span>' + counts.news.length + ' новых · ' + counts.reviews.length + ' повторов</span>' +
+      '</div>' +
+    '</div>' +
+
+    '<div class="flash" data-act="flip">' +
+      '<div class="flash__en">' + esc(card.en) + '</div>' +
+      (flipped
+        ? '<div class="flash__ru">' + esc(card.ru) + '</div>'
+        : '<div class="flash__hint">нажми, чтобы увидеть перевод</div>') +
+    '</div>' +
+
+    (flipped ? '<div class="grades">' + grades + '</div>' : '');
+}
+
+function answerCard(grade) {
+  var q = orderedQueue();
+  if (!q.length) return;
+  var id = q[0];
+  registerAnswer(S, id, grade, TODAY);
+  deferred = deferred.filter(function (x) { return x !== id; });
+  if (grade === 0) { deferred.push(id); Sound.again(); }
+  else { Sound.good(); }
+  flipped = false;
+  Store.save(S);
+  renderCards();
+}
+
+/* ---------------------------------------------------------------- УТРО */
+
+function renderMorning(box, embedded) {
+  var t = morningTarget();
+  var have = S.mrn[t];
+
+  if (have) {
+    box.innerHTML =
+      '<div class="gap-xl center stack">' +
+        '<div class="h1">Спасибо</div>' +
+        '<p class="sub">Ответ за ночь ' + esc(humanDate(t)) + ' записан:<br>' +
+          'засыпание ' + have[0] + ' из 5 · лёг ' + esc(BED_LABEL[have[1]]) + '</p>' +
+      '</div>' +
+      (embedded ? '<button class="btn btn--ghost gap-lg" data-act="to-evening">К вечеру</button>' : '');
+    return;
+  }
+
+  if (S.fin[t] == null) {
+    box.innerHTML =
+      '<div class="gap-xl center stack">' +
+        '<div class="h1">Пока нечего спрашивать</div>' +
+        '<p class="sub">Вопрос про сон появится утром после закрытого вечера.</p>' +
+      '</div>';
+    return;
+  }
+
+  var speedBtns = [1, 2, 3, 4, 5].map(function (v) {
+    return '<button class="choice' + (pendingMorning.speed === v ? ' is-picked' : '') +
+      '" data-act="mrn-speed" data-v="' + v + '">' + v + '</button>';
+  }).join('');
+
+  var bedBtns = BED_LABEL.map(function (lbl, i) {
+    return '<button class="choice' + (pendingMorning.bed === i ? ' is-picked' : '') +
+      '" data-act="mrn-bed" data-v="' + i + '">' + esc(lbl) + '</button>';
+  }).join('');
+
+  box.innerHTML =
+    '<div class="h1" style="font-size:27px">Утро</div>' +
+    '<p class="sub">Про ночь ' + esc(humanDate(t)) + '</p>' +
+
+    '<div class="panel gap-lg">' +
+      '<p class="h2">Как быстро заснул?</p>' +
+      '<div class="choices">' + speedBtns + '</div>' +
+      '<div class="choices__legend"><span>больше часа</span><span>меньше 15 минут</span></div>' +
+    '</div>' +
+
+    '<div class="panel">' +
+      '<p class="h2">Во сколько лёг?</p>' +
+      '<div class="choices choices--wide">' + bedBtns + '</div>' +
+    '</div>';
+}
+
+function commitMorningIfReady() {
+  if (pendingMorning.speed == null || pendingMorning.bed == null) return false;
+  var t = morningTarget();
+  if (S.mrn[t]) return false;
+  S.mrn[t] = [pendingMorning.speed, pendingMorning.bed];
+  pendingMorning = { speed: null, bed: null };
+  Sound.done();
+  Store.save(S, true);
+  return true;
+}
+
+/* ------------------------------------------------------------ ПРОГРЕСС */
+
+function fmtAvg(a) { return a.n ? (Math.round(a.avg * 10) / 10).toFixed(1) : '—'; }
+function fmtBed(a) { return a.n ? minutesToClock(a.avg) : '—'; }
+
+function sleepChart(series) {
+  var W = 320, H = 118, L = 8, R = 8, T = 12, B = 22;
+  var n = series.length;
+  var iw = W - L - R, ih = H - T - B;
+  var x = function (i) { return L + (n === 1 ? iw / 2 : i * iw / (n - 1)); };
+  var y = function (v) { return T + ih - (v - 1) / 4 * ih; };
+
+  var grid = [1, 3, 5].map(function (v) {
+    return '<line x1="' + L + '" y1="' + y(v).toFixed(1) + '" x2="' + (W - R) +
+      '" y2="' + y(v).toFixed(1) + '" stroke="#3a322d" stroke-width="1" ' +
+      (v === 3 ? 'stroke-dasharray="2 4"' : '') + ' opacity=".7"/>';
+  }).join('');
+
+  var segs = [], cur = [];
+  series.forEach(function (p, i) {
+    if (p.speed == null) { if (cur.length > 1) segs.push(cur); cur = []; }
+    else cur.push(x(i).toFixed(1) + ',' + y(p.speed).toFixed(1));
+  });
+  if (cur.length > 1) segs.push(cur);
+
+  var lines = segs.map(function (s) {
+    return '<polyline points="' + s.join(' ') + '" fill="none" stroke="#e0a05a" ' +
+      'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>';
+  }).join('');
+
+  var dots = series.map(function (p, i) {
+    if (p.speed == null) return '';
+    return '<circle cx="' + x(i).toFixed(1) + '" cy="' + y(p.speed).toFixed(1) +
+      '" r="2.6" fill="#e0a05a"/>';
+  }).join('');
+
+  var any = series.some(function (p) { return p.speed != null; });
+  if (!any) {
+    return '<p class="tiny faint center" style="padding:26px 0">Пока нет ответов про сон</p>';
+  }
+
+  return '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
+    'aria-label="Скорость засыпания за 30 дней">' + grid + lines + dots +
+    '<text x="' + L + '" y="' + (H - 6) + '" fill="#7b7168" font-size="10">30 дней назад</text>' +
+    '<text x="' + (W - R) + '" y="' + (H - 6) + '" fill="#7b7168" font-size="10" ' +
+    'text-anchor="end">сегодня</text></svg>';
+}
+
+function renderProgress() {
+  var st = computeStats(S, TODAY);
+  el('progressBody').innerHTML =
+    '<div class="grid2 gap-lg">' +
+      '<div class="stat"><div class="stat__v">' + st.done7 + ' / 7</div>' +
+        '<div class="stat__k">вечеров за 7 дней</div></div>' +
+      '<div class="stat"><div class="stat__v">' + st.done30 + ' / 30</div>' +
+        '<div class="stat__k">вечеров за 30 дней</div></div>' +
+      '<div class="stat"><div class="stat__v">' + st.streak + '</div>' +
+        '<div class="stat__k">' + plural(st.streak, 'день подряд', 'дня подряд', 'дней подряд') +
+        '</div></div>' +
+      '<div class="stat"><div class="stat__v">' + st.learned + '</div>' +
+        '<div class="stat__k">карточек выучено</div></div>' +
+    '</div>' +
+
+    '<div class="panel gap-lg">' +
+      '<div class="row"><div><div class="row__k">Карточек в работе</div>' +
+        '<div class="row__sub">из ' + CARDS.length + ' в колоде</div></div>' +
+        '<div class="stat__v" style="font-size:22px">' + st.inWork + '</div></div>' +
+      '<div class="row"><div><div class="row__k">Засыпание</div>' +
+        '<div class="row__sub">среднее из 5, за 7 и 30 дней</div></div>' +
+        '<div class="stat__v" style="font-size:22px">' + fmtAvg(st.speed7) +
+        ' <span class="faint" style="font-size:15px">/ ' + fmtAvg(st.speed30) + '</span></div></div>' +
+      '<div class="row"><div><div class="row__k">Средний отбой</div>' +
+        '<div class="row__sub">за 7 и 30 дней</div></div>' +
+        '<div class="stat__v" style="font-size:22px">' + fmtBed(st.bed7) +
+        ' <span class="faint" style="font-size:15px">/ ' + fmtBed(st.bed30) + '</span></div></div>' +
+    '</div>' +
+
+    '<div class="panel">' +
+      '<p class="tiny faint" style="margin:0 0 4px">ЗАСЫПАНИЕ ЗА 30 ДНЕЙ</p>' +
+      sleepChart(st.series) +
+    '</div>';
+}
+
+/* ----------------------------------------------------------- НАСТРОЙКИ */
+
+function utf8len(s) {
+  var n = 0;
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    n += c < 0x80 ? 1 : c < 0x800 ? 2 : (c >= 0xd800 && c < 0xdc00 ? (i++, 4) : 3);
+  }
+  return n;
+}
+
+function exportSummary() {
+  var st = computeStats(S, TODAY);
+  return {
+    day: S.day, done7: st.done7, done30: st.done30, streak: st.streak,
+    learned: st.learned, inWork: st.inWork,
+    speed7: st.speed7.n ? Math.round(st.speed7.avg * 10) / 10 : null,
+    bed7: st.bed7.n ? minutesToClock(st.bed7.avg) : null,
+    date: dateISO(TODAY)
+  };
+}
+
+function buildExport() {
+  return JSON.stringify({
+    app: 'english-evenings', v: STATE_V,
+    exported: new Date().toISOString(),
+    summary: exportSummary(),
+    payload: encodeState(S)
+  });
+}
+
+function openSheet() {
+  el('sheetBody').innerHTML =
+    '<div class="row" data-act="toggle-sound" role="switch" aria-checked="' +
+      (S.sound ? 'true' : 'false') + '">' +
+      '<div><div class="row__k">Звуки</div>' +
+      '<div class="row__sub">короткие тихие сигналы</div></div>' +
+      '<span class="toggle' + (S.sound ? ' is-on' : '') + '" aria-hidden="true"></span>' +
+    '</div>' +
+
+    '<div class="row">' +
+      '<div><div class="row__k">Текущий день</div>' +
+      '<div class="row__sub">1–' + TOTAL_DAYS + ', сдвигается сам после Finish</div></div>' +
+      '<input class="numfield" id="dayField" type="number" inputmode="numeric" ' +
+        'min="1" max="' + TOTAL_DAYS + '" value="' + S.day + '">' +
+    '</div>' +
+    '<button class="btn btn--sm btn--ghost" data-act="save-day" style="margin-top:4px">' +
+      'Сохранить день</button>' +
+    '<div id="dayNote"></div>' +
+
+    '<div style="margin-top:22px">' +
+      '<div class="row__k">Экспорт состояния</div>' +
+      '<div class="row__sub">полная копия: карточки, дни, ответы про сон</div>' +
+      '<button class="btn btn--sm btn--ghost" data-act="export" style="margin-top:10px">' +
+        'Экспортировать</button>' +
+      '<div id="exportBox"></div>' +
+    '</div>' +
+
+    '<div style="margin-top:22px">' +
+      '<div class="row__k">Импорт состояния</div>' +
+      '<div class="row__sub">вставь JSON из экспорта — состояние заменится</div>' +
+      '<textarea class="ta" id="importArea" placeholder=\'{"app":"english-evenings",...}\'></textarea>' +
+      '<button class="btn btn--sm btn--ghost" data-act="import" style="margin-top:8px">' +
+        'Импортировать</button>' +
+      '<div id="importNote"></div>' +
+    '</div>';
+  el('sheet').hidden = false;
+}
+
+function closeSheet() { el('sheet').hidden = true; }
+
+function doExport() {
+  var json = buildExport();
+  var box = el('exportBox');
+  var lines = [];
+
+  var sent = false;
+  if (tg && tg.sendData) {
+    try {
+      if (utf8len(json) <= 4096) { tg.sendData(json); sent = true; }
+      else {
+        var small = JSON.stringify({
+          app: 'english-evenings', v: STATE_V,
+          exported: new Date().toISOString(),
+          summary: exportSummary(), partial: true
+        });
+        if (utf8len(small) <= 4096) { tg.sendData(small); }
+        lines.push('<p class="note">Копия целиком не помещается в сообщение Telegram — ' +
+          'в чат ушла только сводка. Полная копия ниже.</p>');
+      }
+    } catch (e) {
+      lines.push('<p class="note">Отправить в чат не получилось — приложение открыто ' +
+        'не с кнопки клавиатуры. Полная копия ниже.</p>');
+    }
+  }
+
+  copyText(json, function (ok) {
+    box.innerHTML =
+      (sent ? '<p class="note note--ok">Отправлено в чат.</p>' : '') +
+      lines.join('') +
+      '<p class="note' + (ok ? ' note--ok' : ' note--warn') + '">' +
+        (ok ? 'Скопировано в буфер обмена.' : 'Буфер недоступен — выдели текст и скопируй:') +
+      '</p>' +
+      '<textarea class="ta" id="exportArea" readonly></textarea>';
+    var area = el('exportArea');
+    area.value = json;
+    if (!ok) { area.focus(); area.setSelectionRange(0, json.length); }
+  });
+  Sound.good();
+}
+
+function doImport() {
+  var note = el('importNote');
+  var raw = (el('importArea').value || '').trim();
+  if (!raw) { note.innerHTML = '<p class="note note--warn">Пусто — вставь JSON.</p>'; return; }
+
+  var payload = null;
+  try {
+    var obj = JSON.parse(raw);
+    if (obj && typeof obj.payload === 'string') payload = obj.payload;
+    else throw new Error('в JSON нет поля payload');
+  } catch (e) {
+    if (raw.indexOf('\n') > 0 && /^\d+\n/.test(raw)) payload = raw;   /* «голая» строка состояния */
+    else {
+      note.innerHTML = '<p class="note note--warn">Не похоже на экспорт: ' +
+        esc(e.message) + '</p>';
+      Sound.again();
+      return;
+    }
+  }
+
+  var next;
+  try { next = decodeState(payload); }
+  catch (e2) {
+    note.innerHTML = '<p class="note note--warn">Состояние повреждено: ' + esc(e2.message) +
+      '</p><p class="note">Текущее состояние не тронуто.</p>';
+    Sound.again();
+    return;
+  }
+
+  S = next;
+  Sound.setOn(S.sound);
+  deferred = []; flipped = false; dayTotal_date = 0; curtainDismissed = false;
+  Store.save(S, true, function (err) {
+    note.innerHTML = err
+      ? '<p class="note note--warn">Прочитано, но не сохранилось: ' + esc(String(err.message || err)) + '</p>'
+      : '<p class="note note--ok">Состояние восстановлено. День ' + S.day + '.</p>';
+  });
+  Sound.done();
+  render();
+}
+
+function saveDay() {
+  var v = parseInt(el('dayField').value, 10);
+  var note = el('dayNote');
+  if (!isFinite(v) || v < 1 || v > TOTAL_DAYS) {
+    note.innerHTML = '<p class="note note--warn">Нужно число от 1 до ' + TOTAL_DAYS + '.</p>';
+    Sound.again();
+    return;
+  }
+  S.day = v;
+  Store.save(S, true);
+  note.innerHTML = '<p class="note note--ok">Текущий день — ' + v + '.</p>';
+  Sound.good();
+  render();
+}
+
+/* ----------------------------------------------------------- ЗАПУСК */
+
+function dismissCurtain() {
+  if (Date.now() - curtainAt < 2500) return;   /* дать занавесу догореть */
+  curtainDismissed = true;
+  curtain(false);
+  render();
+}
+
+function checkRollover() {
+  var t = logicalDate(new Date());
+  if (t === TODAY) return;
+  TODAY = t;
+  curtainDismissed = false;
+  deferred = []; flipped = false; dayTotal_date = 0;
+  pendingMorning = { speed: null, bed: null };
+  if (!el('curtain').hidden) curtain(false);
+  render();
+}
+
+function onAction(e) {
+  var t = e.target && e.target.closest ? e.target.closest('[data-act]') : null;
+  if (!t) return;
+  var a = t.getAttribute('data-act');
+  Sound.unlock();
+
+  if (a === 'open-cards') { Sound.tap(); go('cards'); }
+  else if (a === 'copy-prompt') onCopyPrompt();
+  else if (a === 'finish') doFinish();
+  else if (a === 'flip') { if (!flipped) { flipped = true; Sound.flip(); renderCards(); } }
+  else if (a === 'grade') answerCard(parseInt(t.getAttribute('data-g'), 10));
+  else if (a === 'mrn-speed' || a === 'mrn-bed') {
+    var v = parseInt(t.getAttribute('data-v'), 10);
+    if (a === 'mrn-speed') pendingMorning.speed = v; else pendingMorning.bed = v;
+    Sound.tap();    var embedded = (tab === 'today');
+    var box = embedded ? el('todayBody') : el('morningBody');
+    if (commitMorningIfReady()) {
+      renderMorning(box, embedded);
+      setTimeout(function () { render(); }, 1400);
+    } else {
+      renderMorning(box, embedded);
+    }
+  }
+  else if (a === 'to-evening') render();
+  else if (a === 'toggle-sound') {
+    S.sound = !S.sound;
+    Sound.setOn(S.sound);
+    Store.save(S, true);
+    if (S.sound) Sound.good();
+    openSheet();
+  }
+  else if (a === 'save-day') saveDay();
+  else if (a === 'export') doExport();
+  else if (a === 'import') doImport();
+}
+
+function wire() {
+  var doc = global.document;
+
+  el('tabbar').addEventListener('click', function (e) {
+    var b = e.target && e.target.closest ? e.target.closest('.tab') : null;
+    if (!b) return;
+    Sound.unlock(); Sound.tap();    go(b.getAttribute('data-go'));
+  });
+
+  el('btnSettings').addEventListener('click', function () { Sound.unlock(); openSheet(); });
+  el('curtain').addEventListener('click', dismissCurtain);
+  el('sheet').addEventListener('click', function (e) {
+    if (e.target && e.target.getAttribute && e.target.getAttribute('data-close')) closeSheet();
+  });
+
+  doc.addEventListener('click', onAction);
+  doc.addEventListener('visibilitychange', checkRollover);
+  setInterval(checkRollover, 30000);
+}
+
+/* Бот может открыть приложение на конкретном дне: ?day=N в адресе кнопки
+   или start_param=dN у прямой ссылки Mini App. */
+function requestedDay() {
+  try {
+    var sp = tg && tg.initDataUnsafe ? tg.initDataUnsafe.start_param : null;
+    var m = sp && /^d(\d{1,3})$/.exec(String(sp));
+    if (m) return parseInt(m[1], 10);
+    var loc = global.location;
+    if (loc) {
+      var q = /[?&]day=(\d{1,3})\b/.exec(String(loc.search || '') + '&' + String(loc.hash || ''));
+      if (q) return parseInt(q[1], 10);
+    }
+  } catch (e) {}
+  return 0;
+}
+
+function applyStartParam() {
+  var n = requestedDay();
+  if (n >= 1 && n <= TOTAL_DAYS && n !== S.day) { S.day = n; Store.save(S, true); }
+}
+
+function fatal(msg) {
+  var f = el('fatal');
+  if (!f) return;
+  f.hidden = false;
+  f.textContent = msg;
+  el('app').hidden = true;
+}
+
+function init() {
+  try {
+    tg = (global.Telegram && global.Telegram.WebApp) ? global.Telegram.WebApp : null;
+    if (tg) {
+      tg.ready();
+      var atLeast = function (v) {
+        try { return !tg.isVersionAtLeast || tg.isVersionAtLeast(v); } catch (e) { return false; }
+      };
+      try { tg.expand(); } catch (e) {}
+      if (atLeast('6.1')) {
+        try { tg.setHeaderColor('#141110'); tg.setBackgroundColor('#141110'); } catch (e) {}
+      }
+      if (atLeast('7.7') && tg.disableVerticalSwipes) {
+        try { tg.disableVerticalSwipes(); } catch (e) {}
+      }
+    }
+    Store.attach(tg);
+
+    if (DAYS.length !== TOTAL_DAYS || !CARDS.length) {
+      return fatal('data.js не загрузился или собран неверно: дней ' + DAYS.length +
+        ', карточек ' + CARDS.length + '. Запусти build.py заново.');
+    }
+
+    TODAY = logicalDate(new Date());
+
+    Store.load(function (err, state, how) {
+      S = state;
+      Sound.setOn(S.sound);
+      applyStartParam();
+      el('app').hidden = false;
+      wire();
+      go('today');
+      if (how === 'corrupt' || how === 'error') {
+        setTimeout(function () {
+          var box = el('todayBody');
+          if (box) box.insertAdjacentHTML('afterbegin',
+            '<p class="note note--warn">Сохранённое состояние не прочиталось, ' +
+            'начали с чистого. Если есть копия — восстанови её через Настройки → Импорт.</p>');
+        }, 0);
+      }
+    });
+  } catch (e) {
+    fatal('Ошибка запуска: ' + (e && e.message ? e.message : String(e)));
+  }
+}
+
+/* ------------------------------------------------- экспорт для тестов */
+
+var API = {
+  DAY_MS: DAY_MS, CUTOFF_H: CUTOFF_H, NEW_PER_DAY: NEW_PER_DAY,
+  LEARNED_IVL: LEARNED_IVL, TOTAL_DAYS: TOTAL_DAYS, STATE_V: STATE_V,
+  BED_MIN: BED_MIN, BED_LABEL: BED_LABEL,
+  dateNumOf: dateNumOf, logicalDate: logicalDate, dateParts: dateParts, dateISO: dateISO,
+  minutesToClock: minutesToClock, plural: plural,
+
+  freshCard: freshCard, sm2: sm2,
+  newAllowance: newAllowance, pickNew: pickNew, buildQueue: buildQueue,
+  registerAnswer: registerAnswer, computeStats: computeStats,
+  blankState: blankState, encodeState: encodeState, decodeState: decodeState,
+  checksum: checksum, utf8len: utf8len
+};
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = API;
+} else if (global.document) {
+  if (global.document.readyState === 'loading') {
+    global.document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+}
+
+})(typeof globalThis !== 'undefined' ? globalThis
+   : (typeof window !== 'undefined' ? window : this));

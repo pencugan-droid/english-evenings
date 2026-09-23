@@ -1,0 +1,7 @@
+.env
+state.db
+state.db-wal
+state.db-shm
+__pycache__/
+.venv/
+public/

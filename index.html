@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>Вечерний английский</title>
+<link rel="stylesheet" href="style.css?v=40cefe64">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+
+<div id="app" hidden>
+
+  <header class="topbar">
+    <div class="topbar__title" id="topTitle">Сегодня</div>
+    <button class="iconbtn" id="btnSettings" type="button" aria-label="Настройки">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path fill="currentColor" d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7Zm7.4-2.6.1-.9-.1-.9 1.9-1.5-1.9-3.2-2.3.9a7 7 0 0 0-1.6-.9L15.1 4H10.9l-.4 2.4a7 7 0 0 0-1.6.9L6.6 6.4 4.7 9.6l1.9 1.5-.1.9.1.9-1.9 1.5 1.9 3.2 2.3-.9c.5.4 1 .7 1.6.9l.4 2.4h4.2l.4-2.4c.6-.2 1.1-.5 1.6-.9l2.3.9 1.9-3.2-1.9-1.5Z"/>
+      </svg>
+    </button>
+  </header>
+
+  <main id="screens">
+
+    <!-- ========================= СЕГОДНЯ ========================= -->
+    <section class="screen" id="screen-today" data-tab="today">
+      <div id="todayBody"></div>
+    </section>
+
+    <!-- ======================== КАРТОЧКИ ========================= -->
+    <section class="screen" id="screen-cards" data-tab="cards" hidden>
+      <div id="cardsBody"></div>
+    </section>
+
+    <!-- ========================== УТРО =========================== -->
+    <section class="screen" id="screen-morning" data-tab="morning" hidden>
+      <div id="morningBody"></div>
+    </section>
+
+    <!-- ========================= ПРОГРЕСС ======================== -->
+    <section class="screen" id="screen-progress" data-tab="progress" hidden>
+      <div id="progressBody"></div>
+    </section>
+
+  </main>
+
+  <nav class="tabbar" id="tabbar">
+    <button class="tab is-active" type="button" data-go="today">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 2h2v2h6V2h2v2h2a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2V2Zm12 7H5v10h14V9Z"/></svg>
+      <span>Сегодня</span>
+    </button>
+    <button class="tab" type="button" data-go="cards">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 5h11a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Zm15 2h1a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-1V7Z"/></svg>
+      <span>Карточки</span>
+    </button>
+    <button class="tab" type="button" data-go="morning">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 6a5 5 0 1 1 0 10 5 5 0 0 1 0-10Zm0-5 2 3h-4l2-3ZM1 12l3-2v4l-3-2Zm22 0-3 2v-4l3 2ZM12 23l-2-3h4l-2 3ZM4.2 5.6 7.8 6 6 7.8 4.2 5.6Zm15.6 0L18 7.8 16.2 6l3.6-.4ZM4.2 18.4 6 16.2 7.8 18l-3.6.4Zm15.6 0-3.6-.4 1.8-1.8 1.8 2.2Z"/></svg>
+      <span>Утро</span>
+    </button>
+    <button class="tab" type="button" data-go="progress">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 20h3v-7H4v7Zm6.5 0h3V4h-3v16Zm6.5 0h3v-11h-3v11Z"/></svg>
+      <span>Прогресс</span>
+    </button>
+  </nav>
+
+  <!-- ночной занавес после Finish -->
+  <div class="curtain" id="curtain" hidden>
+    <div class="curtain__text">Спокойной ночи</div>
+  </div>
+
+  <!-- лист настроек -->
+  <div class="sheet" id="sheet" hidden>
+    <div class="sheet__backdrop" data-close="1"></div>
+    <div class="sheet__panel" role="dialog" aria-label="Настройки">
+      <div class="sheet__grip"></div>
+      <div id="sheetBody"></div>
+    </div>
+  </div>
+
+</div>
+
+<div id="fatal" class="fatal" hidden></div>
+
+<script src="data.js?v=40cefe64"></script>
+<script src="app.js?v=40cefe64"></script>
+</body>
+</html>
