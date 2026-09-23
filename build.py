@@ -101,6 +101,82 @@ def parse_voice(raw, day_no):
     )
 
 
+# ------------------------------------------------------- этапы разговора
+
+STAGE_RE_LINE = re.compile(r"^(\d+)\.\s*([A-Za-z]+):\s*(.*)$")
+
+
+def clean_header(head):
+    """Шапка промпта без упоминаний времени и без механики «Next».
+
+    Этапы теперь переключает приложение, а не фраза «Next», и длительность
+    задаёт таймер — поэтому «about 45 minutes» и правило про «Next» лишние.
+    """
+    head = head.replace(" for a calm voice session right before sleep, about 45 minutes.",
+                        " for a calm voice session right before sleep.")
+    out = []
+    for line in head.split("\n"):
+        if line.startswith('- "Next" = next stage.'):
+            continue
+        out.append(line)
+    return "\n".join(out).rstrip() + "\n"
+
+
+def split_stages(prompt, voice, day_no):
+    """Промпт дня -> список этапов [{label, prompt}].
+
+    Первый этап получает полный контекст (уровень, ошибки, правила, фразы,
+    грамматика). Остальные — только свою задачу, без повтора контекста.
+    """
+    i = prompt.find("Stages:")
+
+    # LIGHT-вечер: этапов нет, весь промпт — один этап
+    if i < 0:
+        label = voice[0]["label"] if voice else "Слушаем"
+        # правило про Finish жило в вырезанной строке про «Next» — возвращаем его
+        body = (clean_header(prompt).rstrip() +
+                '\n\nWhen I say "Finish", say only a short calm good night, no summary.\n')
+        return [{"label": label, "prompt": body}]
+
+    header = clean_header(prompt[:i])
+    tail = prompt[i + len("Stages:"):]
+
+    stages, cur = [], None
+    for line in tail.split("\n"):
+        if line.strip().startswith("Start with stage"):
+            break
+        m = STAGE_RE_LINE.match(line.strip())
+        if m:
+            if cur:
+                stages.append(cur)
+            task = m.group(3).strip()
+            if task:
+                task = task[0].upper() + task[1:]     # «a conversation» -> «A conversation»
+            cur = {"label": m.group(2), "task": task}
+        elif cur and line.strip():
+            cur["task"] += " " + line.strip()
+    if cur:
+        stages.append(cur)
+
+    if not stages:
+        fail("День %d: блок Stages есть, но ни один этап не разобран." % day_no)
+
+    out = []
+    for k, st in enumerate(stages):
+        last = (k == len(stages) - 1)
+        finish = ('\nWhen I say "Finish", say only a short calm good night, no summary.\n'
+                  if last else "")
+        if k == 0:
+            body = (header +
+                    "\nNow do this:\n" + st["task"] + "\n" +
+                    finish + "\nStart now.\n")
+        else:
+            body = ("Next stage of the same session. Same rules as before.\n\n" +
+                    st["task"] + "\n" + finish + "\nStart now.\n")
+        out.append({"label": st["label"], "prompt": body})
+    return out
+
+
 # --------------------------------------------------------------------- план
 
 def parse_plan(text):
@@ -152,10 +228,13 @@ def parse_plan(text):
         vi = voice_lines[0]
         if vi < seps[1]:
             fail(f"День {num}: строка «Голос:» оказалась внутри промпта.")
-        stages, note = parse_voice(block[vi][len("Голос:"):], num)
+        stages_voice, note = parse_voice(block[vi][len("Голос:"):], num)
+
+        stages = split_stages(prompt, stages_voice, num)
 
         days.append({
             "n": num,
+            "stages": stages,
             "week": week,
             "weekday": weekday.strip(),
             "type": type_code,
@@ -163,7 +242,7 @@ def parse_plan(text):
             "topic": topic,
             "grammar": grammar,
             "prompt": prompt,
-            "voice": stages,
+            "voice": stages_voice,
             "voiceNote": note,
         })
 

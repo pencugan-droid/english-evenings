@@ -17,6 +17,13 @@ var TOTAL_DAYS = 168;
 var STATE_V = 1;
 var EVENING_H = 22;                    /* с этого часа вкладка «Сегодня» — вечерняя */
 
+/* Длительности этапов разговора, минуты. Talk не фиксирован: он растягивается
+   до момента, когда на оставшиеся этапы хватит ровно их времени. Чем быстрее
+   закрыты карточки, тем длиннее разговор. */
+var STAGE_MIN = { Words: 8, Story: 8, Retell: 12, Result: 12 };
+var TALK_MIN = 10;                     /* короче этого Talk не бывает */
+var FINISH_H = 22, FINISH_M = 58;      /* к этому времени вечер закрыт */
+
 /* кнопки «Во сколько лёг»: индекс -> минуты от 22:00 */
 var BED_MIN = [30, 60, 90, 120, 150];
 var BED_LABEL = ['22:30', '23:00', '23:30', '00:00', 'позже'];
@@ -193,13 +200,14 @@ function p36(s) { var v = parseInt(s, 36); return isFinite(v) ? v : 0; }
 function blankState() {
   return {
     day: 1, sound: true, newScan: 0, newDate: 0, newCount: 0, cpDate: 0,
+    evDate: 0, evStage: 0, evEnd: 0,
     fin: {}, mrn: {}, cards: {}
   };
 }
 
 function encodeState(s) {
-  var head = [s.day, s.sound ? 1 : 0, s.newScan, s.newDate, s.newCount, s.cpDate || 0]
-    .map(b36).join(',');
+  var head = [s.day, s.sound ? 1 : 0, s.newScan, s.newDate, s.newCount, s.cpDate || 0,
+              s.evDate || 0, s.evStage || 0, s.evEnd || 0].map(b36).join(',');
 
   var fin = Object.keys(s.fin).map(Number).sort(numAsc).map(function (d) {
     return b36(d) + ',' + b36(s.fin[d]);
@@ -226,13 +234,16 @@ function decodeState(str) {
 
   var s = blankState();
   var h = parts[1].split(',');
-  if (h.length !== 6) throw new Error('повреждён заголовок состояния');
+  if (h.length !== 9) throw new Error('повреждён заголовок состояния');
   s.day = clamp(p36(h[0]) || 1, 1, TOTAL_DAYS);
   s.sound = p36(h[1]) !== 0;
   s.newScan = Math.max(0, p36(h[2]));
   s.newDate = Math.max(0, p36(h[3]));
   s.newCount = Math.max(0, p36(h[4]));
   s.cpDate = Math.max(0, p36(h[5]));
+  s.evDate = Math.max(0, p36(h[6]));
+  s.evStage = Math.max(0, p36(h[7]));
+  s.evEnd = Math.max(0, p36(h[8]));
 
   if (parts[2]) parts[2].split(';').forEach(function (chunk) {
     var a = chunk.split(',');
@@ -569,6 +580,37 @@ function weekIcon(week) {
 var CHECK_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" ' +
   'd="M9.6 17.2 4.4 12l1.6-1.6 3.6 3.6 8-8L19.2 7.6 9.6 17.2Z"/></svg>';
 
+
+/* ------------------------------------------------- длительности этапов */
+
+/* Сколько минут занимают этапы ПОСЛЕ указанного. Talk считается по минимуму:
+   он и так растягивается, но занять меньше TALK_MIN не может. */
+function minutesAfter(stages, idx) {
+  var sum = 0;
+  for (var i = idx + 1; i < stages.length; i++) {
+    var l = stages[i].label;
+    sum += (l === 'Talk') ? TALK_MIN : (STAGE_MIN[l] || 10);
+  }
+  return sum;
+}
+
+/* Длительность этапа в миллисекундах на момент его запуска. */
+function stageDuration(stages, idx, now) {
+  var label = stages[idx].label;
+  if (label !== 'Talk') return (STAGE_MIN[label] || 10) * 60000;
+
+  var end = new Date(now.getTime());
+  end.setHours(FINISH_H, FINISH_M, 0, 0);
+  if (now.getHours() < CUTOFF_H) end.setDate(end.getDate() - 1);   /* после полуночи */
+  var target = end.getTime() - minutesAfter(stages, idx) * 60000;
+  return Math.max(TALK_MIN * 60000, target - now.getTime());
+}
+
+function dayStages(d) { return (d && d.stages && d.stages.length) ? d.stages : []; }
+
+/* У LIGHT-вечера один этап и он без таймера: там задача — заснуть. */
+function stageHasTimer(stages) { return stages.length > 1; }
+
 /* ------------------------------------------------------------- вкладки */
 
 function go(name) {
@@ -638,13 +680,10 @@ function renderToday() {
   var q = buildQueue(S, TODAY);
   var left = q.all.length;
   var cardsDone = left === 0;
-  var promptDone = S.cpDate === TODAY;
+  var promptDone = (S.evDate === TODAY && S.evStage >= stagesCount(d));
 
-  var tl = d.voice.map(function (st, i) {
-    return '<li class="tl__row"><span class="tl__dot"></span>' +
-      '<span class="tl__time">' + esc(st.time) + '</span>' +
-      '<span class="tl__label">' + esc(st.label) + '</span></li>';
-  }).join('');
+  var stages = dayStages(d);
+  var conv = renderConversation(d, stages);
 
   box.innerHTML =
     '<div class="chip">' + esc(d.type) + ' · ' + esc(d.typeLabel) + '</div>' +
@@ -678,16 +717,8 @@ function renderToday() {
       '<div class="step' + (promptDone ? ' is-done' : '') + '">' +
         '<span class="step__mark">' + CHECK_SVG + '</span>' +
         '<div class="step__body">' +
-          '<p class="step__title">Промпт</p>' +
-          '<p class="step__note">' +
-            (promptDone ? 'Скопирован — вставь в новый чат' : 'Для нового чата в ChatGPT') + '</p>' +
-          '<button class="btn btn--accent" style="margin-top:12px" data-act="copy-prompt">' +
-            (promptDone ? 'Скопировать ещё раз' : 'Скопировать промпт') + '</button>' +
-          '<div id="copyBox"></div>' +
-          '<p class="tiny faint" style="margin-top:10px">' +
-            'Новый чат в ChatGPT → вставить → включить голос → телефон экраном вниз</p>' +
-          '<ul class="tl">' + tl + '</ul>' +
-          (d.voiceNote ? '<p class="tiny faint" style="margin-top:6px">' + esc(d.voiceNote) + '</p>' : '') +
+          '<p class="step__title">Разговор</p>' +
+          conv +
         '</div>' +
       '</div>' +
 
@@ -701,6 +732,134 @@ function renderToday() {
       '</div>' +
 
     '</div>';
+}
+
+
+/* ------------------------------------------------------ экран разговора */
+
+function stagesCount(d) { return dayStages(d).length; }
+
+/* Индекс текущего этапа: 0 — ещё не начинали. */
+function currentStage() {
+  return (S.evDate === TODAY) ? S.evStage : 0;
+}
+
+function stageRunning() {
+  return S.evDate === TODAY && S.evEnd > 0 && Date.now() < S.evEnd * 1000;
+}
+
+function renderConversation(d, stages) {
+  if (!stages.length) return '<p class="step__note">У этого вечера нет этапов.</p>';
+
+  var idx = currentStage();
+
+  /* разговор ещё не начат */
+  if (idx === 0) {
+    var left = buildQueue(S, TODAY).all.length;
+    return '<p class="step__note">' + stages.length + ' ' +
+      plural(stages.length, 'этап', 'этапа', 'этапов') + ': ' +
+      stages.map(function (x) { return esc(x.label); }).join(' → ') + '</p>' +
+      (left ? '<p class="tiny faint" style="margin-top:8px">Сначала карточки — их ' + left + '</p>' : '') +
+      '<button class="btn btn--accent" style="margin-top:12px" data-act="conv-start">' +
+        'Начать разговор</button>';
+  }
+
+  /* все этапы пройдены */
+  if (idx >= stages.length) {
+    return '<p class="step__note">Все этапы пройдены. Скажи «Finish».</p>';
+  }
+
+  var st = stages[idx - 1];
+  var running = stageRunning();
+  var timed = stageHasTimer(stages);
+
+  return '<p class="step__note">Этап ' + idx + ' из ' + stages.length + ' · ' + esc(st.label) + '</p>' +
+    '<button class="btn btn--accent" style="margin-top:12px" data-act="copy-stage">' +
+      'Скопировать ' + esc(st.label) + '</button>' +
+    '<div id="copyBox"></div>' +
+    (idx === 1
+      ? '<p class="tiny faint" style="margin-top:10px">Новый чат в ChatGPT → вставить → включить голос → телефон экраном вниз.<br>' +
+        'Все этапы вставляются <b>в один и тот же чат</b>.</p>'
+      : '<p class="tiny faint" style="margin-top:10px">Вставь в тот же чат, что и раньше.</p>') +
+    (timed
+      ? '<p class="tiny faint" style="margin-top:8px">' +
+          (running ? 'Идёт. Прозвучит сигнал, когда этап закончится.'
+                   : 'Этап отсчитан. Нажми, когда будешь готов дальше.') + '</p>'
+      : '') +
+    '<div class="btn-row" style="margin-top:12px">' +
+      (idx < stages.length
+        ? '<button class="btn btn--sm" data-act="conv-next">' +
+            (idx + 1 <= stages.length ? 'Дальше: ' + esc(stages[idx].label) : 'Дальше') + '</button>'
+        : '<button class="btn btn--sm" data-act="conv-next">Закончить этапы</button>') +
+    '</div>';
+}
+
+/* ---- таймер этапа: без обратного отсчёта на экране ---- */
+
+var stageTimer = null;
+
+function armStageTimer() {
+  if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
+  if (!stageRunning()) return;
+  var ms = S.evEnd * 1000 - Date.now();
+  stageTimer = setTimeout(function () {
+    stageTimer = null;
+    Sound.done();
+    buzz();
+    if (tab === 'today') renderToday();
+  }, Math.max(0, ms));
+}
+
+/* Вибрация в конце этапа: телефон лежит экраном вниз, звука может не хватить. */
+function buzz() {
+  try {
+    if (tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred) {
+      tg.HapticFeedback.notificationOccurred('success');
+      return;
+    }
+  } catch (e) {}
+  try { if (global.navigator && global.navigator.vibrate) global.navigator.vibrate([90, 70, 90]); } catch (e) {}
+}
+
+function startStage(idx) {
+  var d = dayByNumber(S.day);
+  var stages = dayStages(d);
+  if (!stages.length || idx > stages.length) return;
+  S.evDate = TODAY;
+  S.evStage = idx;
+  if (idx >= 1 && idx <= stages.length && stageHasTimer(stages)) {
+    var ms = stageDuration(stages, idx - 1, new Date());
+    S.evEnd = Math.round((Date.now() + ms) / 1000);
+  } else {
+    S.evEnd = 0;
+  }
+  Store.save(S, true);
+  armStageTimer();
+  renderToday();
+}
+
+function onCopyStage() {
+  var d = dayByNumber(S.day);
+  var stages = dayStages(d);
+  var idx = currentStage();
+  if (!stages.length || idx < 1 || idx > stages.length) return;
+  var text = stages[idx - 1].prompt;
+  copyText(text, function (ok) {
+    S.cpDate = TODAY;
+    Store.save(S, true);
+    if (ok) Sound.good(); else Sound.again();
+    if (tab === 'today') renderToday();
+    if (ok) return;
+    var box = el('copyBox');
+    if (!box) return;
+    box.innerHTML =
+      '<p class="note note--warn">Буфер обмена недоступен. Текст выделен — скопируй вручную:</p>' +
+      '<textarea class="ta" id="copyArea" spellcheck="false"></textarea>';
+    var area = el('copyArea');
+    area.value = text;
+    area.focus();
+    area.setSelectionRange(0, text.length);
+  });
 }
 
 /* ------------------------------------------------------ копирование промпта */
@@ -739,37 +898,14 @@ function legacyCopy(text, cb) {
   cb(!!ok);
 }
 
-function onCopyPrompt() {
-  var d = dayByNumber(S.day);
-  if (!d) return;
-  copyText(d.prompt, function (ok) {
-    /* шаг закрывается в обоих случаях: промпт у пользователя либо в буфере,
-       либо выделен на экране для ручного копирования */
-    S.cpDate = TODAY;
-    Store.save(S, true);
-    if (ok) { Sound.good(); }
-    else Sound.again();
-    if (tab === 'today') renderToday();
-    if (ok) return;
-
-    var box = el('copyBox');
-    if (!box) return;
-    box.innerHTML =
-      '<p class="note note--warn">Буфер обмена недоступен. Текст выделен — скопируй вручную:</p>' +
-      '<textarea class="ta" id="copyArea" spellcheck="false"></textarea>';
-    var area = el('copyArea');
-    area.value = d.prompt;
-    area.focus();
-    area.setSelectionRange(0, d.prompt.length);
-  });
-}
-
 /* --------------------------------------------------------------- FINISH */
 
 function doFinish() {
   if (S.fin[TODAY] != null) return;
   S.fin[TODAY] = S.day;
   S.day = Math.min(TOTAL_DAYS, S.day + 1);
+  S.evDate = 0; S.evStage = 0; S.evEnd = 0;
+  if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
   Sound.finish();
   Store.save(S, true);
   showCurtain(true);
@@ -1229,6 +1365,7 @@ function checkRollover() {
   curtainDismissed = false;
   deferred = []; flipped = false; dayTotal_date = 0;
   pendingMorning = { speed: null, bed: null };
+  if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
   if (!el('curtain').hidden) curtain(false);
   render();
 }
@@ -1240,7 +1377,9 @@ function onAction(e) {
   Sound.unlock();
 
   if (a === 'open-cards') { Sound.tap(); go('cards'); }
-  else if (a === 'copy-prompt') onCopyPrompt();
+  else if (a === 'conv-start') startStage(1);
+  else if (a === 'conv-next') startStage(currentStage() + 1);
+  else if (a === 'copy-stage') onCopyStage();
   else if (a === 'finish') doFinish();
   else if (a === 'flip') { if (!flipped) { flipped = true; Sound.flip(); renderCards(); } }
   else if (a === 'grade') answerCard(parseInt(t.getAttribute('data-g'), 10));
@@ -1349,6 +1488,7 @@ function init() {
       applyStartParam();
       el('app').hidden = false;
       wire();
+      armStageTimer();          /* этап мог идти, пока приложение было закрыто */
       go('today');
       if (how === 'corrupt' || how === 'error') {
         setTimeout(function () {
