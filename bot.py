@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime
@@ -41,7 +42,6 @@ from aiogram.types import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-import build  # переиспользуем разбор плана, чтобы бот и приложение не разъехались
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "state.db"
@@ -85,7 +85,41 @@ if not BOT_TOKEN or not CHAT_ID or not MINIAPP_URL:
         "  MINIAPP_URL=https://логин.github.io/репозиторий/\n"
     )
 
-DAYS = build.parse_plan((ROOT / "english-168-evenings.txt").read_text(encoding="utf-8"))
+HEADER_RE = re.compile(r"^ДЕНЬ (\d+) · НЕДЕЛЯ (\d+) · ([^·]+?) · ([A-Z]+) \((.+)\)$")
+
+
+def _load_days():
+    """Читаем из плана только шапки дней.
+
+    Боту нужны номер, неделя, тип, тема и грамматика — промпты живут в Mini App.
+    Полный разбор держал бы в памяти 168 промптов со всеми этапами, а машина
+    тесная: рядом работают VPN и четыре чужих бота.
+    """
+    out, pending = [], None
+    with (ROOT / "english-168-evenings.txt").open(encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            m = HEADER_RE.match(line)
+            if m:
+                pending = {"n": int(m.group(1)), "week": int(m.group(2)),
+                           "type": m.group(4), "typeLabel": m.group(5),
+                           "topic": "", "grammar": ""}
+                out.append(pending)
+            elif pending is not None:
+                if line.startswith("Тема: "):
+                    pending["topic"] = line[len("Тема: "):].strip()
+                elif line.startswith("Грамматика недели: "):
+                    pending["grammar"] = line[len("Грамматика недели: "):].strip()
+                    pending = None
+    if len(out) != 168:
+        sys.exit("В плане найдено %d дней вместо 168 — проверь english-168-evenings.txt" % len(out))
+    bad = [d["n"] for d in out if not d["topic"] or not d["grammar"]]
+    if bad:
+        sys.exit("У дней %s не разобраны тема или грамматика" % bad[:5])
+    return out
+
+
+DAYS = _load_days()
 BY_NUM = {d["n"]: d for d in DAYS}
 TOTAL_DAYS = len(DAYS)
 
