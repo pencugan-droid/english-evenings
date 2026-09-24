@@ -118,7 +118,57 @@ def clean_header(head):
     for line in head.split("\n"):
         if line.startswith('- "Next" = next stage.'):
             continue
+        # голосовой режим быстро теряет нить: разрешаем объяснять только по
+        # ключевому слову — значит живой вопрос останется без ответа
+        # echo целого предложения прячет саму ошибку: меняется два места
+        # сразу, и непонятно, что именно было не так
+        if line.startswith('- If I say a Russian word'):
+            out.append('- If I say a Russian word because I don\'t know it in English, give me '
+                       'the English word right away and make me say that phrase in English with '
+                       'the new word. Keep it short.')
+            continue
+        if line.startswith('- I know a lot of words but my grammar is weak.'):
+            out.append('- I know a lot of words but my grammar is weak. When I make a mistake, '
+                       'never just repeat my whole sentence back. First name the mistake in the '
+                       'shortest form: the wrong words, an arrow, the right words, like '
+                       '"was eating -> ate". Then add the reason in three or four words, like '
+                       '"finished action". Only after that say my full sentence corrected, once.')
+            out.append('- Do not make me repeat long sentences. If my sentence is longer than '
+                       'about ten words, I repeat only the corrected part, not the whole sentence.')
+            out.append('- Fix one mistake at a time. If I made several, take the most important '
+                       'one first and leave the rest for later.')
+            continue
+        if line.startswith('- If I say "Explain"'):
+            out.append('- If I ask you anything, in any English, however broken, answer it '
+                       'directly in 1-2 simple sentences before continuing. Never ignore my '
+                       'question. Never change the subject while my question is unanswered.')
+            out.append('- When I ask "why", give the rule in one sentence and then one pair of '
+                       'examples: the wrong version and the right version.')
+            out.append('- If I say "Slower", slow down. If I say "Again", repeat.')
+            continue
         out.append(line)
+
+    extra = [
+        '- Correct my mistakes in EVERY sentence I say, including in my questions to you.',
+        '- Never put words in my mouth. Repeat back only what I actually said. '
+        'If you did not hear me clearly, say "Say that again, please." Never guess.',
+        '- Let me finish speaking before you answer. Do not talk over me.',
+    ]
+    # дописываем В КОНЕЦ блока Rules, а не в конец шапки: иначе правила
+    # оказываются после списка фраз и читаются как отдельный мусор
+    last_rule = -1
+    in_rules = False
+    for i, line in enumerate(out):
+        if line.startswith("Rules:"):
+            in_rules = True
+            continue
+        if in_rules and line.startswith("- "):
+            last_rule = i
+        elif in_rules and last_rule >= 0:
+            break
+    if last_rule < 0:
+        fail("В промпте не найден блок Rules — правила некуда дописать.")
+    out[last_rule + 1:last_rule + 1] = extra
     return "\n".join(out).rstrip() + "\n"
 
 
@@ -167,8 +217,15 @@ def split_stages(prompt, voice, day_no):
         finish = ('\nWhen I say "Finish", say only a short calm good night, no summary.\n'
                   if last else "")
         if k == 0:
+            counter = ""
+            if "phrases" in st["task"].lower() or "New phrases" in header:
+                counter = ("\nGo through the phrase list strictly in order, one at a time. "
+                           "Start every phrase with its number, like (1/10), (2/10). "
+                           "Do not move to the next phrase until I have used the current one "
+                           "correctly in my own sentence. If I drift off, bring me back to the "
+                           "phrase we are on.\n")
             body = (header +
-                    "\nNow do this:\n" + st["task"] + "\n" +
+                    "\nNow do this:\n" + st["task"] + "\n" + counter +
                     finish + "\nStart now.\n")
         else:
             body = ("Next stage of the same session. Same rules as before.\n\n" +
@@ -232,6 +289,21 @@ def parse_plan(text):
 
         stages = split_stages(prompt, stages_voice, num)
 
+        # этапы режутся из промпта — убеждаемся, что ничего не сочинено
+        flat = " ".join(prompt.split())
+        for st in stages:
+            core = st["prompt"].split("Now do this:")[-1]
+            core = core.split("Same rules as before.")[-1]
+            core = core.split("When I say")[0].split("Start now.")[0].strip()
+            first = " ".join(core.split())[:60]
+            if first and first[:1].isupper():
+                probe = first[0].lower() + first[1:]
+            else:
+                probe = first
+            if first and probe not in flat and first not in flat:
+                fail("День %d, этап %s: текст задачи не найден в исходном промпте.\n  %r"
+                     % (num, st["label"], first))
+
         days.append({
             "n": num,
             "stages": stages,
@@ -241,7 +313,6 @@ def parse_plan(text):
             "typeLabel": type_label.strip(),
             "topic": topic,
             "grammar": grammar,
-            "prompt": prompt,
             "voice": stages_voice,
             "voiceNote": note,
         })

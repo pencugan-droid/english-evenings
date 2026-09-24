@@ -30,6 +30,18 @@ var TALK_TAG = 'talk';                 /* тег карточек, пришед�
 
 /* Этап разбора добавляет приложение, а не план: промпт один и тот же на все дни. */
 var REVIEW_LABEL = 'Review';
+
+/* Короткая реплика, когда собеседник поплыл: бросил список фраз, перестал
+   исправлять или начал додумывать за меня. Вставляется в тот же чат. */
+var ANCHOR_PROMPT =
+  'Stop. Back to the rules. ' +
+  'Repeat back only what I actually said \u2014 never guess my words. ' +
+  'Correct every mistake I make, including in my questions. ' +
+  'Name each mistake shortly first \u2014 wrong words, arrow, right words \u2014 ' +
+  'then the reason in a few words. Do not repeat my whole long sentence back. ' +
+  'Answer my questions directly, even when my English is broken. ' +
+  'Continue the phrase list from where we stopped and say the number, like (3/10). ' +
+  'Short turns. Continue now.';
 var REVIEW_PROMPT =
   'Разбор без похвалы. Перечисли мои ошибки за сегодняшний разговор: ' +
   'грамматика (особенно past simple vs present perfect), неправильные глаголы, ' +
@@ -973,6 +985,8 @@ function renderConversation(d, stages) {
       ? '<p class="tiny faint" style="margin-top:10px">Новый чат в ChatGPT → вставить → включить голос → телефон экраном вниз.<br>' +
         'Все этапы вставляются <b>в один и тот же чат</b>.</p>'
       : '<p class="tiny faint" style="margin-top:10px">Вставь в тот же чат, что и раньше.</p>') +
+    '<button class="btn btn--sm btn--ghost" style="margin-top:8px" data-act="copy-anchor">' +
+      'Поплыл — вернуть в русло</button>' +
     (timed
       ? '<p class="tiny faint" style="margin-top:8px">' +
           (running ? 'Идёт. Прозвучит сигнал, когда этап закончится.'
@@ -1607,6 +1621,19 @@ function onAction(e) {
   else if (a === 'conv-next') startStage(currentStage() + 1);
   else if (a === 'copy-stage') onCopyStage();
   else if (a === 'save-review') onSaveReview();
+  else if (a === 'copy-anchor') {
+    copyText(ANCHOR_PROMPT, function (ok) {
+      if (ok) { Sound.good(); return; }
+      Sound.again();
+      var box = el('copyBox');
+      if (!box) return;
+      box.innerHTML = '<p class="note note--warn">Буфер недоступен, скопируй вручную:</p>' +
+        '<textarea class="ta" id="copyArea" spellcheck="false"></textarea>';
+      var ar = el('copyArea');
+      ar.value = ANCHOR_PROMPT;
+      ar.focus(); ar.setSelectionRange(0, ANCHOR_PROMPT.length);
+    });
+  }
   else if (a === 'finish') doFinish();
   else if (a === 'flip') { if (!flipped) { flipped = true; Sound.flip(); renderCards(); } }
   else if (a === 'grade') answerCard(parseInt(t.getAttribute('data-g'), 10));
