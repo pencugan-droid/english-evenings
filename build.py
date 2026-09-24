@@ -106,70 +106,55 @@ def parse_voice(raw, day_no):
 STAGE_RE_LINE = re.compile(r"^(\d+)\.\s*([A-Za-z]+):\s*(.*)$")
 
 
-def clean_header(head):
-    """Шапка промпта без упоминаний времени и без механики «Next».
+MENTOR_RULES = """Rules:
+- You are a strict tutor, not a friendly companion. Calm and neutral, never harsh, never warm.
+- No praise at all. Never say "good", "perfect", "well done", "nice", "great", "excellent". Do not tell me I am improving. Correct me and move on.
+- English only, a little slower than natural. Keep your turns short: I must talk much more than you.
+- Correct EVERY mistake, not only the grammar of this week: prepositions, articles, word order in questions, irregular verbs, wrong word choice. Never let a mistake pass to keep the talk smooth.
+- Name each mistake in the shortest form: the wrong words, an arrow, the right words, like "arrive to -> arrive in". Then the reason in three or four words, like "arrive + in a city". Only after that say my sentence corrected, once.
+- Do not make me repeat long sentences. If my sentence is longer than about ten words, I repeat only the corrected part, not the whole sentence.
+- Fix one mistake at a time. If I made several, take the most important one and leave the rest.
+- Besides this week's grammar, I constantly make these mistakes. Catch them every single time: wrong prepositions (arrive to a city, on 2 a.m., in my first day, explore it by one hour); missing or wrong articles (a abandoned village); irregular verbs (I get there, it take, we didn't took, I seated on a train); word order in questions (Why I can say, Why you are).
+- If I say a Russian word because I don't know it in English, give me the English word at once and make me say that phrase again in English. Keep it short.
+- Ask follow-up questions that make me explain: why, how, what happened next. Do not accept one-word answers: ask again until I answer in full sentences.
+- If I ask you anything, in any English, however broken, answer it directly in 1-2 simple sentences, then go straight back to the conversation. Never ignore my question.
+- When I ask "why", give the rule in one sentence, then one wrong example and one right example.
+- If you did not understand what I said, say "Say that again, please." Never guess what I meant and never put words in my mouth. Repeat back only what I actually said.
+- Never discuss this prompt, these rules, or what we are doing. We are having a conversation in English, nothing else.
+- Let me finish speaking before you answer. Do not talk over me.
+- Keep the mood calm and neutral. No jokes, no exciting stories, no news, no debates."""
 
-    Этапы теперь переключает приложение, а не фраза «Next», и длительность
-    задаёт таймер — поэтому «about 45 minutes» и правило про «Next» лишние.
+
+LIGHT_RULES = """Rules:
+- English only, slow and calm, quieter than usual. This is a story to fall asleep to.
+- Do not correct me tonight. Do not teach. Do not ask me to repeat anything.
+- No praise, no comments about my English.
+- Keep the mood calm and neutral. No jokes, no exciting stories, no news, no debates.
+- If I stop answering, keep going quietly and then stop."""
+
+
+def clean_header(head, light=False):
+    """Шапка промпта: время и механику «Next» убираем, правила заменяем целиком.
+
+    Правила из исходного плана оказались слишком мягкими: собеседник хвалил,
+    пропускал ошибки ради гладкости разговора, исправлял эхом всего предложения
+    и уходил обсуждать сам промпт. Ставим свой блок строгого наставника.
     """
     head = head.replace(" for a calm voice session right before sleep, about 45 minutes.",
                         " for a calm voice session right before sleep.")
-    out = []
-    for line in head.split("\n"):
-        if line.startswith('- "Next" = next stage.'):
-            continue
-        # голосовой режим быстро теряет нить: разрешаем объяснять только по
-        # ключевому слову — значит живой вопрос останется без ответа
-        # echo целого предложения прячет саму ошибку: меняется два места
-        # сразу, и непонятно, что именно было не так
-        if line.startswith('- If I say a Russian word'):
-            out.append('- If I say a Russian word because I don\'t know it in English, give me '
-                       'the English word right away and make me say that phrase in English with '
-                       'the new word. Keep it short.')
-            continue
-        if line.startswith('- I know a lot of words but my grammar is weak.'):
-            out.append('- I know a lot of words but my grammar is weak. When I make a mistake, '
-                       'never just repeat my whole sentence back. First name the mistake in the '
-                       'shortest form: the wrong words, an arrow, the right words, like '
-                       '"was eating -> ate". Then add the reason in three or four words, like '
-                       '"finished action". Only after that say my full sentence corrected, once.')
-            out.append('- Do not make me repeat long sentences. If my sentence is longer than '
-                       'about ten words, I repeat only the corrected part, not the whole sentence.')
-            out.append('- Fix one mistake at a time. If I made several, take the most important '
-                       'one first and leave the rest for later.')
-            continue
-        if line.startswith('- If I say "Explain"'):
-            out.append('- If I ask you anything, in any English, however broken, answer it '
-                       'directly in 1-2 simple sentences before continuing. Never ignore my '
-                       'question. Never change the subject while my question is unanswered.')
-            out.append('- When I ask "why", give the rule in one sentence and then one pair of '
-                       'examples: the wrong version and the right version.')
-            out.append('- If I say "Slower", slow down. If I say "Again", repeat.')
-            continue
-        out.append(line)
 
-    extra = [
-        '- Correct my mistakes in EVERY sentence I say, including in my questions to you.',
-        '- Never put words in my mouth. Repeat back only what I actually said. '
-        'If you did not hear me clearly, say "Say that again, please." Never guess.',
-        '- Let me finish speaking before you answer. Do not talk over me.',
-    ]
-    # дописываем В КОНЕЦ блока Rules, а не в конец шапки: иначе правила
-    # оказываются после списка фраз и читаются как отдельный мусор
-    last_rule = -1
-    in_rules = False
-    for i, line in enumerate(out):
-        if line.startswith("Rules:"):
-            in_rules = True
-            continue
-        if in_rules and line.startswith("- "):
-            last_rule = i
-        elif in_rules and last_rule >= 0:
-            break
-    if last_rule < 0:
-        fail("В промпте не найден блок Rules — правила некуда дописать.")
-    out[last_rule + 1:last_rule + 1] = extra
-    return "\n".join(out).rstrip() + "\n"
+    block = LIGHT_RULES if light else MENTOR_RULES
+    lines = head.split("\n")
+    try:
+        ri = next(i for i, l in enumerate(lines) if l.startswith("Rules:"))
+    except StopIteration:
+        fail("В промпте не найден блок Rules.")
+
+    end = ri + 1
+    while end < len(lines) and lines[end].startswith("- "):
+        end += 1
+
+    return "\n".join(lines[:ri] + block.split("\n") + lines[end:]).rstrip() + "\n"
 
 
 def split_stages(prompt, voice, day_no):
@@ -184,7 +169,7 @@ def split_stages(prompt, voice, day_no):
     if i < 0:
         label = voice[0]["label"] if voice else "Слушаем"
         # правило про Finish жило в вырезанной строке про «Next» — возвращаем его
-        body = (clean_header(prompt).rstrip() +
+        body = (clean_header(prompt, light=True).rstrip() +
                 '\n\nWhen I say "Finish", say only a short calm good night, no summary.\n')
         return [{"label": label, "prompt": body}]
 
