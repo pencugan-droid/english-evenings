@@ -22,6 +22,8 @@ var EVENING_H = 22;                    /* с этого часа вкладка 
    закрыты карточки, тем длиннее разговор. */
 var STAGE_MIN = { Words: 8, Story: 8, Retell: 12, Result: 12 };
 var TALK_MIN = 10;                     /* короче этого Talk не бывает */
+var TALK_MAX = 30;                     /* и длиннее тоже: утренний вечер на выходных
+                                          иначе растянулся бы до 22:38, то есть на часы */
 var REVIEW_MAX = 12;                   /* сколько ошибок подставлять в промпт */
 var REVIEW_DAYS = 7;                   /* за сколько дней их брать */
 var REVIEW_KEEP = 30;                  /* сколько дней разборов вообще хранить */
@@ -130,9 +132,39 @@ function sm2(st, grade, today) {
 
 /* ------------------------------------------------------------- очередь */
 
+/* Сколько вечеров начато в эти сутки: на выходных их может быть два. */
+function sessionsToday(state, today) {
+  return (state.sdate === today) ? Math.min(2, state.snum || 1) : 1;
+}
+
 function newAllowance(state, today) {
   var used = (state.newDate === today) ? state.newCount : 0;
-  return Math.max(0, NEW_PER_DAY - used);
+  return Math.max(0, NEW_PER_DAY * sessionsToday(state, today) - used);
+}
+
+/* Суббота и воскресенье — дни, когда разрешён второй вечер. */
+function isWeekend(dateNum) {
+  var wd = dateParts(dateNum).wd;
+  return wd === 0 || wd === 6;
+}
+
+/* Идёт ли сейчас второй вечер этих суток. */
+function inSecondEvening(state, today) {
+  return state.sdate === today && (state.snum || 1) === 2;
+}
+
+/* Закрыт ли ТЕКУЩИЙ вечер. Если начат второй — смотреть надо на его слот,
+   иначе экран так и останется на «Сегодня закрыто». */
+function currentEveningDone(state, today) {
+  return inSecondEvening(state, today)
+    ? state.fin2[today] != null
+    : state.fin[today] != null;
+}
+
+/* Второй вечер доступен: выходной, первый закрыт, второй ещё не начат. */
+function secondEveningAvailable(state, today) {
+  return isWeekend(today) && state.fin[today] != null
+    && state.fin2[today] == null && !inSecondEvening(state, today);
 }
 
 /* Следующие невыданные карточки строго по порядку колоды. */
@@ -346,7 +378,8 @@ function blankState() {
   return {
     day: 1, sound: true, newScan: 0, newDate: 0, newCount: 0, cpDate: 0,
     evDate: 0, evStage: 0, evEnd: 0,
-    fin: {}, mrn: {}, cards: {},
+    sdate: 0, snum: 1,        /* дата и номер вечера в эти сутки (1 или 2) */
+    fin: {}, mrn: {}, cards: {}, fin2: {},   /* fin2 — второй вечер за ту же дату */
     rev: [],                 /* [{d, w, r}] — дата, ошибка, как правильно */
     extra: []                /* [{d, en, ru}] — карточки из разговоров */
   };
@@ -354,7 +387,8 @@ function blankState() {
 
 function encodeState(s) {
   var head = [s.day, s.sound ? 1 : 0, s.newScan, s.newDate, s.newCount, s.cpDate || 0,
-              s.evDate || 0, s.evStage || 0, s.evEnd || 0].map(b36).join(',');
+              s.evDate || 0, s.evStage || 0, s.evEnd || 0,
+              s.sdate || 0, s.snum || 1].map(b36).join(',');
 
   var fin = Object.keys(s.fin).map(Number).sort(numAsc).map(function (d) {
     return b36(d) + ',' + b36(s.fin[d]);
@@ -378,7 +412,11 @@ function encodeState(s) {
     return b36(x.d) + ',' + enc(x.en) + ',' + enc(x.ru);
   }).join(';');
 
-  return [STATE_V, head, fin, mrn, crd, rev, ext].join('\n');
+  var fin2 = Object.keys(s.fin2 || {}).map(Number).sort(numAsc).map(function (d) {
+    return b36(d) + ',' + b36(s.fin2[d]);
+  }).join(';');
+
+  return [STATE_V, head, fin, mrn, crd, rev, ext, fin2].join('\n');
 }
 
 /* encodeURIComponent экранирует и запятую, и точку с запятой, и перевод строки —
@@ -391,14 +429,16 @@ function decodeState(str) {
   var parts = str.split('\n');
   /* 5 секций — состояние до появления разбора ошибок; принимаем и дополняем */
   if (parts.length === 5) parts = parts.concat(['', '']);
-  if (parts.length !== 7) throw new Error('ожидалось 7 секций, получено ' + parts.length);
+  if (parts.length === 7) parts = parts.concat(['']);
+  if (parts.length !== 8) throw new Error('ожидалось 8 секций, получено ' + parts.length);
   if (p36(parts[0]) !== STATE_V) throw new Error('версия состояния ' + parts[0] + ', поддерживается ' + STATE_V);
 
   var s = blankState();
   var h = parts[1].split(',');
-  /* 6 полей — заголовок до появления этапов разговора */
+  /* 6 полей — до этапов разговора, 9 — до второго вечера на выходных */
   if (h.length === 6) h = h.concat(['0', '0', '0']);
-  if (h.length !== 9) throw new Error('повреждён заголовок состояния');
+  if (h.length === 9) h = h.concat(['0', '1']);
+  if (h.length !== 11) throw new Error('повреждён заголовок состояния');
   s.day = clamp(p36(h[0]) || 1, 1, TOTAL_DAYS);
   s.sound = p36(h[1]) !== 0;
   s.newScan = Math.max(0, p36(h[2]));
@@ -408,6 +448,8 @@ function decodeState(str) {
   s.evDate = Math.max(0, p36(h[6]));
   s.evStage = Math.max(0, p36(h[7]));
   s.evEnd = Math.max(0, p36(h[8]));
+  s.sdate = Math.max(0, p36(h[9]));
+  s.snum = Math.min(2, Math.max(1, p36(h[10]) || 1));
 
   if (parts[2]) parts[2].split(';').forEach(function (chunk) {
     var a = chunk.split(',');
@@ -444,6 +486,12 @@ function decodeState(str) {
     var a = chunk.split(',');
     if (a.length !== 3) throw new Error('повреждена запись карточки из разговора: ' + chunk);
     s.extra.push({ d: p36(a[0]), en: dec(a[1]), ru: dec(a[2]) });
+  });
+
+  if (parts[7]) parts[7].split(';').forEach(function (chunk) {
+    var a = chunk.split(',');
+    if (a.length !== 2) throw new Error('повреждена запись второго вечера: ' + chunk);
+    s.fin2[p36(a[0])] = p36(a[1]);
   });
 
   /* newScan — только подсказка, восстанавливаем честно */
@@ -782,7 +830,10 @@ function stageDuration(stages, idx, now) {
   end.setHours(FINISH_H, FINISH_M, 0, 0);
   if (now.getHours() < CUTOFF_H) end.setDate(end.getDate() - 1);   /* после полуночи */
   var target = end.getTime() - minutesAfter(stages, idx) * 60000;
-  return Math.max(TALK_MIN * 60000, target - now.getTime());
+  var left = target - now.getTime();
+  if (left < TALK_MIN * 60000) left = TALK_MIN * 60000;
+  if (left > TALK_MAX * 60000) left = TALK_MAX * 60000;
+  return left;
 }
 
 function dayStages(d) {
@@ -843,14 +894,21 @@ function renderToday() {
 
   if (needMorning()) { renderMorning(box, true); return; }
 
-  if (S.fin[TODAY] != null) {
+  if (currentEveningDone(S, TODAY)) {
     if (isNight() && !curtainDismissed) { showCurtain(false); return; }
+    var canSecond = secondEveningAvailable(S, TODAY);
+    var doneDay = (S.fin2[TODAY] != null) ? S.fin2[TODAY] : S.fin[TODAY];
     box.innerHTML =
       '<div class="gap-xl center stack">' +
         '<div class="h1">Сегодня закрыто</div>' +
-        '<p class="sub">День ' + esc(S.fin[TODAY]) + ' сделан. ' +
-        'Следующий откроется завтра.</p>' +
-      '</div>';
+        '<p class="sub">День ' + esc(doneDay) + ' сделан. ' +
+        (canSecond ? 'Выходной — можно взять ещё один.' : 'Следующий откроется завтра.') +
+        '</p>' +
+      '</div>' +
+      (canSecond
+        ? '<button class="btn btn--accent gap-lg" data-act="second-evening">' +
+            'Ещё один вечер · день ' + S.day + '</button>'
+        : '');
     return;
   }
 
@@ -1143,14 +1201,15 @@ function legacyCopy(text, cb) {
 /* --------------------------------------------------------------- FINISH */
 
 function doFinish() {
-  if (S.fin[TODAY] != null) return;
-  S.fin[TODAY] = S.day;
+  if (currentEveningDone(S, TODAY)) return;
+  if (inSecondEvening(S, TODAY)) S.fin2[TODAY] = S.day; else S.fin[TODAY] = S.day;
   S.day = Math.min(TOTAL_DAYS, S.day + 1);
   S.evDate = 0; S.evStage = 0; S.evEnd = 0;
   if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
   Sound.finish();
   Store.save(S, true);
-  showCurtain(true);
+  if (isNight()) showCurtain(true);      /* «Спокойной ночи» уместна только ночью */
+  else { curtainDismissed = true; render(); }
   reportToBot();
 }
 
@@ -1601,6 +1660,22 @@ function dismissCurtain() {
   render();
 }
 
+/* Второй вечер за те же сутки: чистим состояние разговора и открываем
+   следующий день плана. Карточек становится доступно ещё шесть. */
+function startSecondEvening() {
+  if (!secondEveningAvailable(S, TODAY)) return;
+  S.sdate = TODAY;
+  S.snum = 2;
+  S.evDate = 0; S.evStage = 0; S.evEnd = 0;
+  S.cpDate = 0;
+  curtainDismissed = false;
+  deferred = []; flipped = false; dayTotal_date = 0;
+  if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
+  Store.save(S, true);
+  Sound.good();
+  render();
+}
+
 function checkRollover() {
   var t = logicalDate(new Date());
   if (t === TODAY) return;
@@ -1620,6 +1695,7 @@ function onAction(e) {
   Sound.unlock();
 
   if (a === 'open-cards') { Sound.tap(); go('cards'); }
+  else if (a === 'second-evening') startSecondEvening();
   else if (a === 'conv-start') startStage(1);
   else if (a === 'conv-next') startStage(currentStage() + 1);
   else if (a === 'copy-stage') onCopyStage();
@@ -1772,6 +1848,9 @@ var API = {
 
   freshCard: freshCard, sm2: sm2,
   newAllowance: newAllowance, pickNew: pickNew, buildQueue: buildQueue,
+  isWeekend: isWeekend, sessionsToday: sessionsToday,
+  secondEveningAvailable: secondEveningAvailable,
+  currentEveningDone: currentEveningDone, inSecondEvening: inSecondEvening,
   parseReview: parseReview, saveReview: saveReview, recentMistakes: recentMistakes,
   withMistakes: withMistakes, cardCount: cardCount, cardAt: cardAt,
   reviewKey: reviewKey, REVIEW_MAX: REVIEW_MAX, REVIEW_DAYS: REVIEW_DAYS,
